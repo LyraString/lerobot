@@ -44,7 +44,7 @@ from .lerobot_dataset import LeRobotDataset
 from .multi_dataset import MultiLeRobotDataset
 from .pipeline_features import aggregate_pipeline_dataset_features, create_initial_features
 from .pyav_utils import check_video_encoder_parameters_pyav, detect_available_encoders_pyav
-from .sampler import EpisodeAwareSampler, compute_sampler_state
+from .sampler import EpisodeAwareSampler, GroupedEpisodeAwareSampler, compute_sampler_state
 from .storage import register_dataset_reader
 from .streaming_dataset import StreamingLeRobotDataset
 from .utils import DEFAULT_EPISODES_PATH, create_lerobot_dataset_card, resolve_episode_indices
@@ -61,6 +61,7 @@ __all__ = [
     "DEFAULT_QUANTILES",
     "EVENT_ONLY_STYLES",
     "EpisodeAwareSampler",
+    "GroupedEpisodeAwareSampler",
     "LeRobotDataset",
     "LeRobotDatasetMetadata",
     "MultiLeRobotDataset",

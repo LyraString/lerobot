@@ -178,6 +178,10 @@ class TrainPipelineConfig(HubMixin):
     # Sample weighting configuration (e.g., for RA-BC training)
     sample_weighting: SampleWeightingConfig | None = None
 
+    # Keep the normalizer/unnormalizer statistics saved with --policy.path when starting a new
+    # fine-tuning run. By default, fresh runs adapt those processors to the active dataset stats.
+    preserve_pretrained_processor_stats: bool = False
+
     # Rename map for the observation to override the image and state keys
     rename_map: dict[str, str] = field(default_factory=dict)
     checkpoint_path: Path | None = field(init=False, default=None)
@@ -284,6 +288,11 @@ class TrainPipelineConfig(HubMixin):
             )
 
         active_cfg = self.trainable_config
+        if self.preserve_pretrained_processor_stats:
+            if self.is_reward_model_training or active_cfg.pretrained_path is None:
+                raise ValueError(
+                    "preserve_pretrained_processor_stats requires a pretrained --policy.path."
+                )
         if self.rename_map and active_cfg.pretrained_path is None:
             raise ValueError(
                 "`rename_map` requires a pretrained policy checkpoint. "

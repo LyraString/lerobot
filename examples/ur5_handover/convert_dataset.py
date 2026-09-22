@@ -93,6 +93,12 @@ class VideoReader:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--raw-root", type=Path, required=True)
+    parser.add_argument(
+        "--correction-root",
+        type=Path,
+        default=None,
+        help="Optional correction dataset. All successful episodes are appended as dataset_source=1.",
+    )
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--repo-id", default="local/ur5-handover")
     parser.add_argument("--num-episodes", type=int, default=None)
@@ -226,6 +232,11 @@ def dataset_features(image_shape: tuple[int, int, int]) -> dict:
             "shape": (1,),
             "names": None,
         },
+        "dataset_source": {
+            "dtype": "int64",
+            "shape": (1,),
+            "names": None,
+        },
     }
 
 
@@ -250,7 +261,9 @@ def inspect_image_shape(episode: EpisodePaths) -> tuple[int, int, int]:
     return shapes.pop()
 
 
-def convert_episode(dataset: LeRobotDataset, episode: EpisodePaths) -> tuple[int, str]:
+def convert_episode(
+    dataset: LeRobotDataset, episode: EpisodePaths, *, dataset_source: int
+) -> tuple[int, str]:
     metadata = load_episode_metadata(episode)
     with h5py.File(episode.hdf5, "r") as h5_file:
         states = np.asarray(h5_file["observations/robot/agent_qpos"], dtype=np.float32)
@@ -276,6 +289,7 @@ def convert_episode(dataset: LeRobotDataset, episode: EpisodePaths) -> tuple[int
                 "action": action,
                 "source_episode_index": np.asarray([episode.source_index], dtype=np.int64),
                 "source_frame_index": np.asarray([frame_index], dtype=np.int64),
+                "dataset_source": np.asarray([dataset_source], dtype=np.int64),
             }
             frame.update(
                 {
@@ -302,18 +316,26 @@ def main() -> None:
     args = parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     raw_root = args.raw_root.expanduser().resolve()
+    correction_root = args.correction_root.expanduser().resolve() if args.correction_root else None
     output_root = args.output_root.expanduser().resolve()
     if output_root.exists():
         raise FileExistsError(f"Refusing to overwrite existing output: {output_root}")
 
     heldout = parse_heldout_episodes(args.heldout_episodes)
-    episodes = select_episodes(
+    primary_episodes = select_episodes(
         discover_episodes(raw_root),
         split=args.split,
         heldout=heldout,
         num_episodes=args.num_episodes,
     )
-    image_shape = inspect_image_shape(episodes[0])
+    episode_groups = [(0, "original", raw_root, primary_episodes)]
+    if correction_root is not None:
+        correction_episodes = select_episodes(
+            discover_episodes(correction_root), split="all", heldout=set(), num_episodes=None
+        )
+        episode_groups.append((1, "correction", correction_root, correction_episodes))
+
+    image_shape = inspect_image_shape(primary_episodes[0])
     dataset = LeRobotDataset.create(
         repo_id=args.repo_id,
         root=output_root,
@@ -326,28 +348,41 @@ def main() -> None:
 
     converted = []
     try:
-        for output_episode_index, episode in enumerate(episodes):
-            logging.info(
-                "Converting source episode %d (%d/%d)",
-                episode.source_index,
-                output_episode_index + 1,
-                len(episodes),
-            )
-            frame_count, task = convert_episode(dataset, episode)
-            converted.append(
-                {
-                    "output_episode_index": output_episode_index,
-                    "source_episode_index": episode.source_index,
-                    "frames": frame_count,
-                    "task": task,
-                }
-            )
+        total_episodes = sum(len(group[3]) for group in episode_groups)
+        for dataset_source, source_name, source_root, episodes in episode_groups:
+            for episode in episodes:
+                output_episode_index = len(converted)
+                logging.info(
+                    "Converting %s episode %d (%d/%d)",
+                    source_name,
+                    episode.source_index,
+                    output_episode_index + 1,
+                    total_episodes,
+                )
+                frame_count, task = convert_episode(
+                    dataset, episode, dataset_source=dataset_source
+                )
+                converted.append(
+                    {
+                        "output_episode_index": output_episode_index,
+                        "dataset_source": dataset_source,
+                        "source_name": source_name,
+                        "source_root": str(source_root),
+                        "source_episode_index": episode.source_index,
+                        "frames": frame_count,
+                        "task": task,
+                    }
+                )
     finally:
         dataset.finalize()
 
-    selected_source_indices = {item["source_episode_index"] for item in converted}
+    selected_source_indices = {
+        item["source_episode_index"] for item in converted if item["dataset_source"] == 0
+    }
     manifest = {
         "source_root": str(raw_root),
+        "correction_root": str(correction_root) if correction_root is not None else None,
+        "dataset_sources": {"0": "original", "1": "correction"} if correction_root else {"0": "original"},
         "repo_id": args.repo_id,
         "split": args.split,
         "fps": 20,

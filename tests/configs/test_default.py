@@ -62,3 +62,30 @@ def test_dataset_config_eval_split():
     DatasetConfig(repo_id="user/repo", repo_type="bucket", eval_split=0.1)
     with pytest.raises(ValueError, match="streaming"):
         DatasetConfig(repo_id="user/repo", streaming=True, eval_split=0.1)
+
+
+def test_dataset_config_grouped_sampling_requires_key_and_weights():
+    with pytest.raises(ValueError, match="must either both be set"):
+        DatasetConfig(repo_id="user/repo", sampling_group_key="dataset_source")
+    with pytest.raises(ValueError, match="must either both be set"):
+        DatasetConfig(repo_id="user/repo", sampling_group_weights=[0.75, 0.25])
+
+
+@pytest.mark.parametrize("weights", [[], [-1.0, 2.0], [0.0, 0.0]])
+def test_dataset_config_rejects_invalid_grouped_sampling_weights(weights):
+    with pytest.raises(ValueError, match="sampling_group_weights"):
+        DatasetConfig(
+            repo_id="user/repo",
+            sampling_group_key="dataset_source",
+            sampling_group_weights=weights,
+        )
+
+
+def test_dataset_config_rejects_grouped_sampling_for_streaming():
+    with pytest.raises(ValueError, match="map-style"):
+        DatasetConfig(
+            repo_id="user/repo",
+            streaming=True,
+            sampling_group_key="dataset_source",
+            sampling_group_weights=[0.75, 0.25],
+        )

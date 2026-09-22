@@ -60,7 +60,7 @@ from lerobot.common.train_utils import (
 from lerobot.common.wandb_utils import WandBLogger
 from lerobot.configs import JobConfig, parser
 from lerobot.configs.train import TrainPipelineConfig
-from lerobot.datasets import EpisodeAwareSampler, compute_sampler_state
+from lerobot.datasets import EpisodeAwareSampler, GroupedEpisodeAwareSampler, compute_sampler_state
 from lerobot.datasets.factory import make_train_eval_datasets
 from lerobot.distributed import (
     ParallelDims,
@@ -290,7 +290,28 @@ def make_dataloaders(
         # BatchSamplerShard without needing a `generator` attribute to synchronize an RNG, and
         # resume is sample-exact.
         shuffle = False
-        sampler = EpisodeAwareSampler(
+        sampler_cls = EpisodeAwareSampler
+        sampler_kwargs = {}
+        if cfg.dataset.sampling_group_key is not None:
+            group_key = cfg.dataset.sampling_group_key
+            if group_key not in dataset.hf_dataset.column_names:
+                raise ValueError(
+                    f"sampling_group_key={group_key!r} is not a dataset frame feature; "
+                    f"available columns: {dataset.hf_dataset.column_names}"
+                )
+            group_ids = dataset.hf_dataset[group_key]
+            sampler_cls = GroupedEpisodeAwareSampler
+            sampler_kwargs = {
+                "group_ids": group_ids,
+                "group_weights": cfg.dataset.sampling_group_weights,
+            }
+            if is_main_process():
+                logging.info(
+                    "Using grouped frame sampling from %s with weights %s",
+                    group_key,
+                    cfg.dataset.sampling_group_weights,
+                )
+        sampler = sampler_cls(
             dataset.meta.episodes["dataset_from_index"],
             dataset.meta.episodes["dataset_to_index"],
             episode_indices_to_use=dataset.episodes,
@@ -298,6 +319,7 @@ def make_dataloaders(
             shuffle=True,
             seed=cfg.seed if cfg.seed is not None else 0,
             absolute_to_relative_idx=dataset.absolute_to_relative_idx,
+            **sampler_kwargs,
         )
         if cfg.resume and step > 0:
             # The resume offset depends on the (dp_world_size, batch_size) that produced `step`,
@@ -507,7 +529,11 @@ def train(cfg: TrainPipelineConfig):
 
     processor_kwargs = ProcessorConfigKwargs()
     processor_dataset_stats = rename_stats(dataset.meta.stats, cfg.rename_map)
-    if (processor_pretrained_path and not cfg.resume) or not processor_pretrained_path:
+    preserve_processor_stats = cfg.preserve_pretrained_processor_stats and processor_pretrained_path
+    should_supply_dataset_stats = (
+        (processor_pretrained_path and not cfg.resume) or not processor_pretrained_path
+    ) and not preserve_processor_stats
+    if should_supply_dataset_stats:
         processor_kwargs["dataset_stats"] = processor_dataset_stats
     if cfg.is_reward_model_training:
         processor_kwargs["dataset_meta"] = dataset.meta
@@ -530,9 +556,11 @@ def train(cfg: TrainPipelineConfig):
         # been adapted by the policy (e.g. EVO1 pads state/action stats to max_state_dim),
         # and force-feeding raw dataset stats over them crashes normalization (#4006).
         # This mirrors the `dataset_stats` kwarg above, which is also skipped on resume.
-        if not cfg.resume:
+        if not cfg.resume and not preserve_processor_stats:
             preprocessor_overrides["normalizer_processor"]["stats"] = processor_dataset_stats
             postprocessor_overrides["unnormalizer_processor"]["stats"] = processor_dataset_stats
+        elif preserve_processor_stats and is_main_process():
+            logging.info("Keeping normalizer statistics from pretrained policy %s", processor_pretrained_path)
         if getattr(active_cfg, "use_relative_actions", False):
             preprocessor_overrides["relative_actions_processor"] = {
                 "enabled": True,

@@ -55,6 +55,11 @@ class DatasetConfig:
     streaming: bool = False
     # Fraction of episodes held out per task for offline evaluation (0.0 = disabled).
     eval_split: float = 0.0
+    # Optional deterministic source balancing for map-style datasets. `sampling_group_key`
+    # names an integer frame feature and `sampling_group_weights[i]` is the desired fraction
+    # for group i. Sampling is exact over one sampler epoch and may repeat frames from small groups.
+    sampling_group_key: str | None = None
+    sampling_group_weights: list[float] | None = None
 
     def __post_init__(self) -> None:
         if self.repo_type not in ("dataset", "bucket"):
@@ -69,6 +74,17 @@ class DatasetConfig:
             )
         if not (0.0 <= self.eval_split < 1.0):
             raise ValueError(f"eval_split must be in [0.0, 1.0), got {self.eval_split}")
+        if (self.sampling_group_key is None) != (self.sampling_group_weights is None):
+            raise ValueError(
+                "sampling_group_key and sampling_group_weights must either both be set or both be None."
+            )
+        if self.sampling_group_weights is not None:
+            if self.streaming:
+                raise ValueError("Grouped sampling is only supported for map-style datasets.")
+            if not self.sampling_group_weights or any(weight < 0 for weight in self.sampling_group_weights):
+                raise ValueError("sampling_group_weights must be a non-empty list of non-negative values.")
+            if sum(self.sampling_group_weights) <= 0:
+                raise ValueError("sampling_group_weights must contain at least one positive value.")
         if self.episodes is not None:
             if any(ep < 0 for ep in self.episodes):
                 raise ValueError(

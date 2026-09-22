@@ -159,6 +159,78 @@ class EpisodeAwareSampler:
         return self._num_frames
 
 
+class GroupedEpisodeAwareSampler(EpisodeAwareSampler):
+    """Episode-aware sampler with an exact target fraction for integer frame groups.
+
+    The sampler keeps the usual episode filtering and deterministic resume behavior. Within each
+    epoch it draws ``len(self)`` samples according to ``group_weights``. Groups that need fewer
+    samples than they contain are sampled without replacement; smaller groups are reshuffled and
+    repeated as needed.
+    """
+
+    def __init__(self, *args, group_ids, group_weights: list[float], **kwargs):
+        super().__init__(*args, **kwargs)
+        if not group_weights or any(weight < 0 for weight in group_weights):
+            raise ValueError("group_weights must be a non-empty list of non-negative values")
+        weight_sum = float(sum(group_weights))
+        if weight_sum <= 0:
+            raise ValueError("group_weights must contain at least one positive value")
+
+        group_ids = np.asarray(group_ids, dtype=np.int64).reshape(-1)
+        valid_indices = np.asarray(self.indices, dtype=np.int64)
+        if valid_indices.max(initial=-1) >= len(group_ids):
+            raise ValueError("group_ids must contain one entry for every dataset frame")
+
+        present_groups = set(group_ids[valid_indices].tolist())
+        configured_groups = set(range(len(group_weights)))
+        unknown_groups = present_groups - configured_groups
+        if unknown_groups:
+            raise ValueError(f"Dataset contains unconfigured sampling groups: {sorted(unknown_groups)}")
+
+        positive_missing = [
+            group for group, weight in enumerate(group_weights) if weight > 0 and group not in present_groups
+        ]
+        if positive_missing:
+            raise ValueError(f"No valid frames found for sampling groups: {positive_missing}")
+
+        self._group_indices = [
+            valid_indices[group_ids[valid_indices] == group] for group in range(len(group_weights))
+        ]
+        normalized = np.asarray(group_weights, dtype=np.float64) / weight_sum
+        expected = normalized * self._num_frames
+        counts = np.floor(expected).astype(np.int64)
+        remainder = self._num_frames - int(counts.sum())
+        if remainder:
+            order = np.argsort(-(expected - counts), kind="stable")
+            counts[order[:remainder]] += 1
+        self._group_counts = counts
+
+    @staticmethod
+    def _draw_group(indices: np.ndarray, count: int, generator: torch.Generator) -> torch.Tensor:
+        if count == 0:
+            return torch.empty(0, dtype=torch.int64)
+        source = torch.as_tensor(indices, dtype=torch.int64)
+        draws = []
+        remaining = count
+        while remaining > 0:
+            take = min(remaining, len(source))
+            draws.append(source[torch.randperm(len(source), generator=generator)[:take]])
+            remaining -= take
+        return torch.cat(draws)
+
+    def _iter_epoch(self, epoch: int, start: int) -> Iterator[int]:
+        generator = self._epoch_generator(epoch)
+        draws = [
+            self._draw_group(indices, int(count), generator)
+            for indices, count in zip(self._group_indices, self._group_counts, strict=True)
+            if count > 0
+        ]
+        epoch_indices = torch.cat(draws)
+        epoch_indices = epoch_indices[torch.randperm(len(epoch_indices), generator=generator)]
+        for index in epoch_indices[start:]:
+            yield int(index)
+
+
 def compute_sampler_state(step: int, num_frames: int, batch_size: int, num_processes: int) -> dict:
     """Map an optimization step to an `EpisodeAwareSampler` state for sample-exact resume.
 

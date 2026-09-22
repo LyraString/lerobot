@@ -25,7 +25,39 @@ from datasets import Dataset  # noqa: E402
 from lerobot.datasets.io_utils import (
     hf_transform_to_torch,
 )
-from lerobot.datasets.sampler import EpisodeAwareSampler, compute_sampler_state
+from lerobot.datasets.sampler import EpisodeAwareSampler, GroupedEpisodeAwareSampler, compute_sampler_state
+
+
+def test_grouped_sampler_uses_exact_weights_and_reproduces():
+    kwargs = {
+        "dataset_from_indices": [0, 6],
+        "dataset_to_indices": [6, 8],
+        "group_ids": [0, 0, 0, 0, 0, 0, 1, 1],
+        "group_weights": [0.75, 0.25],
+        "shuffle": True,
+        "seed": 42,
+    }
+    sampler_a = GroupedEpisodeAwareSampler(**kwargs)
+    sampler_b = GroupedEpisodeAwareSampler(**kwargs)
+    indices = list(sampler_a)
+    assert indices == list(sampler_b)
+    assert len(indices) == 8
+    assert sum(index < 6 for index in indices) == 6
+    assert sum(index >= 6 for index in indices) == 2
+
+
+def test_grouped_sampler_repeats_small_groups_to_meet_weight():
+    sampler = GroupedEpisodeAwareSampler(
+        [0, 9],
+        [9, 10],
+        group_ids=[0] * 9 + [1],
+        group_weights=[0.5, 0.5],
+        shuffle=True,
+        seed=0,
+    )
+    indices = list(sampler)
+    assert len(indices) == 10
+    assert indices.count(9) == 5
 
 
 def calculate_episode_data_index(hf_dataset: Dataset) -> dict[str, torch.Tensor]:
