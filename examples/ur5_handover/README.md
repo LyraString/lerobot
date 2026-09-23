@@ -141,14 +141,18 @@ uv run --no-sync python examples/ur5_handover/convert_dataset.py \
   --split=train
 ```
 
-Start a new full-model fine-tuning run from the 50k policy checkpoint. This is
-not a resume: optimizer and scheduler state start fresh. `steps=20000` counts
-micro-batches; with gradient accumulation 2 this produces 10,000 optimizer
-updates and an effective batch size of 24. The Accelerate-wrapped scheduler
-advances only on optimizer updates, so its 500-step warmup and 10,000-step decay
-span the whole run. Each sampler epoch contains exactly 75% original frames and
-25% correction frames. The pretrained checkpoint's normalization statistics
-remain authoritative.
+The following command records the completed round-01 full-model fine-tuning run
+from the 50k policy checkpoint. It started a fresh optimizer and scheduler.
+`steps=20000` counts micro-batches; with gradient accumulation 2, this produced
+10,000 optimizer updates and an effective batch size of 24. Each sampler epoch
+contains 75% original frames and 25% correction frames. The pretrained
+checkpoint's normalization statistics remain authoritative.
+
+**Learning-rate correction:** The saved scheduler state shows that it advanced
+once per micro-batch in this run. With warmup=500 and decay=10000 below, the
+learning rate reached its 2.5e-6 floor at micro-batch 10000 and stayed there
+for the remaining half. To make a *new* 20000-micro-batch run decay across the
+whole run, use warmup=1000 and decay=20000 and choose a new output directory.
 
 ```bash
 cd /home/idiot/zhj/ler/lerobot
