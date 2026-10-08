@@ -1,0 +1,70 @@
+{
+  "dataset": {
+    "repo_id": "lerobot/libero",
+    "revision": "a1aaacb7f6cd6ee5fb43120f673cebb0cfea7dd4",
+    "video_backend": "torchcodec"
+  },
+  "policy": {
+    "type": "pi05",
+    "pretrained_path": "lerobot/pi05_base",
+    "device": "cuda",
+    "dtype": "bfloat16",
+    "chunk_size": 10,
+    "n_action_steps": 5,
+    "empty_cameras": 1,
+    "train_expert_only": false,
+    "freeze_vision_encoder": false,
+    "gradient_checkpointing": true,
+    "use_relative_actions": false,
+    "normalization_mapping": {
+      "ACTION": "QUANTILES",
+      "STATE": "QUANTILES",
+      "VISUAL": "IDENTITY"
+    },
+    "optimizer_lr": 0.0001,
+    "optimizer_weight_decay": 1e-10,
+    "optimizer_grad_clip_norm": 1.0,
+    "scheduler_warmup_steps": 1000,
+    "scheduler_decay_steps": 30000,
+    "scheduler_decay_lr": 0.00001,
+    "push_to_hub": false
+  },
+  "peft": {
+    "method_type": "LORA",
+    "target_modules": ".*\\.(language_model|gemma_expert)\\..*\\.(self_attn\\.(q|k|v|o)_proj|mlp\\.(gate|up|down)_proj)",
+    "full_training_modules": [
+      "vision_tower",
+      "action_in_proj",
+      "action_out_proj",
+      "time_mlp_in",
+      "time_mlp_out"
+    ],
+    "r": 16,
+    "lora_alpha": 16
+  },
+  "accelerator": {
+    "mixed_precision": "bf16",
+    "gradient_accumulation": {
+      "steps": 1
+    }
+  },
+  "ema": {
+    "enable": false
+  },
+  "batch_size": 16,
+  "num_workers": 8,
+  "steps": 30000,
+  "log_freq": 100,
+  "save_freq": 10000,
+  "seed": 42,
+  "preserve_pretrained_processor_stats": false,
+  "output_dir": "outputs/train/pi05_base_libero_hybrid_lora_r16_30k",
+  "job_name": "pi05_base_libero_hybrid_lora_r16_30k",
+  "wandb": {
+    "enable": true,
+    "mode": "online",
+    "entity": "lyrastring-zhejiang-university",
+    "project": "pi05-libero",
+    "disable_artifact": true
+  }
+}
