@@ -414,3 +414,25 @@ Single-task grasp-and-place with 50 clean episodes: ACT should reach **> 70% suc
 - **Community:** [Discord](https://discord.com/invite/s3KuuzsPFb) · [Hub `LeRobot` tag](https://huggingface.co/datasets?other=LeRobot) · [Dataset visualizer](https://huggingface.co/spaces/lerobot/visualize_dataset)
 
 > Keep this file current. If you learn a rule that would prevent a class of user mistakes, add it here and in [`AGENTS.md`](./AGENTS.md).
+
+---
+
+## 10. Repository conventions
+
+This repository follows upstream LeRobot's architecture and development conventions, including for local experiments.
+Use `CONTRIBUTING.md`, `AI_POLICY.md`, `pyproject.toml`, and `.pre-commit-config.yaml` as the project references.
+
+- Extend existing modules and configuration mechanisms before introducing parallel implementations or new entry points.
+- Place policy code in `src/lerobot/policies/<policy>/`, processing in `src/lerobot/processor/`, dataset code in
+  `src/lerobot/datasets/`, and environment code in `src/lerobot/envs/`. Put reusable CLI entry points in
+  `src/lerobot/scripts/` and register them through `pyproject.toml` when needed.
+- Keep runnable examples and experiment recipes under the appropriate `examples/` directory, user documentation
+  under `docs/source/`, tests under the corresponding `tests/` directory, and generated artifacts under `outputs/`.
+- Match neighboring code's naming, typing, imports, logging, error handling, and optional dependency patterns.
+  Use English for reusable code comments and docstrings, following the surrounding files.
+- Pass machine-specific paths, GPU selection, account settings, and experiment values through configuration,
+  environment variables, or CLI arguments rather than embedding them in reusable implementation code.
+- Reuse the standard `lerobot-train` and `lerobot-eval` workflows and existing dataset, processor, policy, and
+  checkpoint interfaces. Keep changes scoped so users familiar with upstream LeRobot can understand them.
+- Run the relevant project formatting and validation checks for changed files. Preserve upstream compatibility
+  when implementing local features and document any intentional behavioral differences.
