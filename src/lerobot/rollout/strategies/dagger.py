@@ -254,8 +254,8 @@ class DAggerStrategy(RolloutStrategy):
         self._episode_lock = Lock()
 
     def setup(self, ctx: RolloutContext) -> None:
-        """Initialise the inference engine and input device listener."""
-        self._init_engine(ctx)
+        """Initialise the inference engine, View Ablation, and input device listener."""
+        super().setup(ctx)
         dataset_cfg = ctx.runtime.cfg.dataset  # never None: dataset_mode="required"
         if self.config.num_episodes is None:
             self.config.num_episodes = dataset_cfg.num_episodes

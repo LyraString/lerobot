@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
-from copy import copy
+from copy import copy, deepcopy
 from dataclasses import dataclass, field
 from threading import Event
 from typing import TYPE_CHECKING
@@ -40,6 +40,7 @@ from lerobot.policies import get_policy_class, make_pre_post_processors
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.processor import (
     PolicyProcessorPipeline,
+    RenameObservationsProcessorStep,
     RobotAction,
     RobotObservation,
     RobotProcessorPipeline,
@@ -49,6 +50,7 @@ from lerobot.processor import (
 from lerobot.processor.relative_action_processor import RelativeActionsProcessorStep
 from lerobot.robots import make_robot_from_config
 from lerobot.teleoperators import Teleoperator, make_teleoperator_from_config
+from lerobot.utils.constants import ACTION
 from lerobot.utils.feature_utils import combine_feature_dicts, hw_to_dataset_features
 from lerobot.utils.import_utils import _peft_available, require_package
 
@@ -59,8 +61,11 @@ from .inference import (
     SyncInferenceConfig,
     create_inference_engine,
 )
-from .inference.rtc import supports_rtc_inference
+from .inference.rtc import accepts_noise_injection, supports_rtc_inference
 from .robot_wrapper import ThreadSafeRobot
+
+if TYPE_CHECKING:
+    from .saliency.manager import SaliencyManager
 
 if TYPE_CHECKING or _peft_available:
     from peft import PeftConfig, PeftModel
@@ -228,6 +233,9 @@ class PolicyContext:
     preprocessor: PolicyProcessorPipeline
     postprocessor: PolicyProcessorPipeline
     inference: InferenceEngine
+    saliency: SaliencyManager | None = None
+    # View ablation runtime; None when ``--view_mask.enabled=false``.
+    view_mask: object | None = None
 
 
 @dataclass
@@ -266,6 +274,92 @@ class RolloutContext:
 # ---------------------------------------------------------------------------
 # Build
 # ---------------------------------------------------------------------------
+
+
+def _find_rename_insert_index(preprocessor: PolicyProcessorPipeline) -> int:
+    """Index just past the last observation-rename step, i.e. where the mask step goes.
+
+    The mask must run *after* the rename (so it targets the canonical keys the policy
+    reads) and *before* every normalization and policy-specific image transform (so
+    the zeroed image is normalized exactly like any other frame).  When a pipeline has
+    no rename step at all the mask goes first, which is the same position for a
+    pipeline whose keys are already canonical.
+    """
+    last_rename = -1
+    for index, step in enumerate(preprocessor.steps):
+        if isinstance(step, RenameObservationsProcessorStep):
+            last_rename = index
+    return last_rename + 1
+
+
+#: Dataset feature names added by view ablation.  Absent entirely when disabled,
+#: so an ablation-free dataset schema is bit-for-bit what it was before.
+def _view_mask_dataset_features(canonical_views: tuple[str, ...]) -> dict:
+    """The two per-frame mask fields, named by canonical view key."""
+    return {
+        "view_mask": {
+            "dtype": "bool",
+            "shape": (len(canonical_views),),
+            # Names (not just a shape) so a resumed run can prove the vector means
+            # the same thing — the same views, in the same slot order.
+            "names": list(canonical_views),
+        },
+        "view_mask_revision": {
+            "dtype": "int64",
+            "shape": (1,),
+            "names": None,
+        },
+    }
+
+
+def _validate_view_mask_dataset(dataset: LeRobotDataset, canonical_views: tuple[str, ...]) -> None:
+    """Refuse to resume a dataset whose mask schema does not match this run.
+
+    Migration is deliberately not attempted: silently appending differently-shaped
+    or differently-named mask columns would produce a dataset whose frames cannot be
+    compared, which is worse than asking the operator to start a new recording.
+    """
+    features = dataset.meta.features if hasattr(dataset.meta, "features") else {}
+    problems: list[str] = []
+    for name, expected in _view_mask_dataset_features(canonical_views).items():
+        actual = features.get(name)
+        if actual is None:
+            problems.append(f"{name!r} is missing")
+            continue
+        if actual.get("dtype") != expected["dtype"]:
+            problems.append(f"{name!r} dtype is {actual.get('dtype')!r}, expected {expected['dtype']!r}")
+        elif tuple(actual.get("shape", ())) != tuple(expected["shape"]):
+            problems.append(f"{name!r} shape is {actual.get('shape')}, expected {expected['shape']}")
+        elif name == "view_mask" and list(actual.get("names") or []) != list(canonical_views):
+            problems.append(f"{name!r} names are {actual.get('names')}, expected {list(canonical_views)}")
+    if problems:
+        raise ValueError(
+            "Cannot --resume this dataset with view ablation enabled: "
+            + "; ".join(problems)
+            + ". Start a new dataset (drop --resume) — the mask schema cannot be migrated."
+        )
+
+
+def _inject_view_mask_step(preprocessor: PolicyProcessorPipeline) -> None:
+    """Splice the View Mask step into the checkpoint preprocessor, in memory only.
+
+    Deliberately not written back to the checkpoint's processor config: the step is a
+    rollout runtime concern, and persisting it would make every other consumer of the
+    checkpoint (eval, record) silently mask the same views.
+    """
+    from .view_mask.processor import ViewMaskProcessorStep
+
+    if any(isinstance(step, ViewMaskProcessorStep) for step in preprocessor.steps):
+        return
+    steps = list(preprocessor.steps)
+    insert_at = _find_rename_insert_index(preprocessor)
+    steps.insert(insert_at, ViewMaskProcessorStep())
+    preprocessor.steps = steps
+    logger.info(
+        "View ablation: mask processor injected at preprocessor step %d of %d",
+        insert_at,
+        len(steps),
+    )
 
 
 def _load_pretrained_policy(policy_config: PreTrainedConfig) -> PreTrainedPolicy:
@@ -344,268 +438,384 @@ def build_rollout_context(
     policy.eval()
     logger.info("Policy loaded: type=%s, device=%s", policy_config.type, cfg.device)
 
-    torch_compile_active = cfg.use_torch_compile
-    if cfg.use_torch_compile and policy.type not in ("pi0", "pi05"):
-        torch_compile_active = _wrap_predict_action_chunk_with_torch_compile(
-            policy,
-            backend=cfg.torch_compile_backend,
-            mode=cfg.torch_compile_mode,
+    saliency_manager = None
+    if cfg.saliency.enabled:
+        # Local import inside the saliency-only branch: pulls the manager (and transitively
+        # cv2 via the recorder) in only when saliency is enabled. The saliency package
+        # __init__ stays import-light by design, so importing through it costs nothing here.
+        from lerobot.rollout.saliency.manager import SaliencyManager, resolve_explainer_device
+
+        # Resolve the explainer device up front and make it explicit on cfg.saliency:
+        # from_pretrained loads onto config.device, so without the override the copy's
+        # weights would land on the policy's GPU first and only then move, transiently
+        # doubling policy-GPU residency. resolve_explainer_device gives an explicit
+        # cfg_device the win, so the manager re-resolves to the same device.
+        saliency_explainer_device = resolve_explainer_device(cfg.saliency.device, cfg.device or "cpu")
+        cfg.saliency.device = saliency_explainer_device
+
+        def _load_explainer_policy():
+            # torch.compile and the load device must stay off the explainer's copy:
+            # without the device override, from_pretrained would load onto the policy's
+            # GPU first (config object is shared), transiently doubling policy-GPU
+            # residency before .to(explainer_device) moves it.
+            explainer_config = deepcopy(policy_config)
+            if hasattr(explainer_config, "compile_model"):
+                explainer_config.compile_model = False
+            if hasattr(explainer_config, "device"):
+                explainer_config.device = saliency_explainer_device
+            return _load_pretrained_policy(explainer_config)
+
+        logger.info("Saliency enabled — loading explainer model copy on %s...", saliency_explainer_device)
+        saliency_manager = SaliencyManager(
+            cfg.saliency,
+            policy_config,
+            policy_device=cfg.device or "cpu",
+            display_mode=cfg.display_mode,
+            load_policy=_load_explainer_policy,
         )
 
-    if cfg.use_torch_compile and not torch_compile_active:
-        # RolloutConfig.__post_init__ reloads the policy configuration, so avoid
-        # dataclasses.replace when carrying the effective state downstream.
-        cfg = copy(cfg)
-        cfg.use_torch_compile = False
-
-    # --- 2. Robot-side processors (user-supplied or defaults) --------
-    if (
-        teleop_action_processor is None
-        or robot_action_processor is None
-        or robot_observation_processor is None
-    ):
-        _t, _r, _o = make_default_processors()
-        teleop_action_processor = teleop_action_processor or _t
-        robot_action_processor = robot_action_processor or _r
-        robot_observation_processor = robot_observation_processor or _o
-
-    # --- 3. Hardware (heaviest side-effect, deferred) -----------------
-    logger.info("Connecting robot (%s)...", cfg.robot.type if cfg.robot else "?")
-    robot = make_robot_from_config(cfg.robot)
-    robot.connect()
-    logger.info("Robot connected: %s", robot.name)
-
-    # Store the initial joint positions so we can return to a safe pose on shutdown.
-    initial_obs = robot.get_observation()
-    initial_position = {k: v for k, v in initial_obs.items() if k.endswith(".pos")}
-    logger.info("Captured initial robot position (%d keys)", len(initial_position))
-
-    robot_wrapper = ThreadSafeRobot(robot)
-
-    teleop = None
-    if cfg.teleop is not None:
-        logger.info("Connecting teleoperator (%s)...", cfg.teleop.type if cfg.teleop else "?")
-        teleop = make_teleoperator_from_config(cfg.teleop)
-        teleop.connect()
-        logger.info("Teleoperator connected")
-
-    # TODO(Steven): once Teleoperator motor-control methods are standardised
-    # (``enable_torque`` / ``disable_torque`` / ``write_goal_positions``), gate
-    # the DAgger strategy on their presence here and fail fast with a helpful
-    # message instead of relying on the operator to pre-align the leader by
-    # hand.  See :func:`DAggerStrategy._apply_transition` for the matching
-    # disabled call sites.
-    # if isinstance(cfg.strategy, DAggerStrategyConfig) and teleop is not None:
-    #     required_teleop_methods = ("enable_torque", "disable_torque", "write_goal_positions")
-    #     missing = [m for m in required_teleop_methods if not callable(getattr(teleop, m, None))]
-    #     if missing:
-    #         teleop.disconnect()
-    #         raise ValueError(
-    #             f"DAgger strategy requires a teleoperator with motor control methods "
-    #             f"{required_teleop_methods}. '{type(teleop).__name__}' is missing: {missing}"
-    #         )
-
-    # --- 4. Features + action-key reconciliation ---------------------
-    # TODO(Steven):Only ``.pos`` joint features are routed to the policy as state and as the
-    # action target; velocity and torque channels (when present) are kept in
-    # the raw observation but excluded from the policy-facing tensors.
-    all_obs_features = robot.observation_features
-    # ``observation_features`` values are either a tuple (camera shape) or the
-    # ``float`` type itself used as a sentinel for scalar motor features —
-    # see ``dict[str, type | tuple]`` annotation on ``Robot.observation_features``.
-    # Keep cameras (tuple) plus both joint-position (.pos) and base-velocity (.vel)
-    # scalar state features. LeKiwi's observation.state is 9-dim (6 arm .pos +
-    # x/y/theta.vel) and the policy was trained/normalized on all 9; the old .pos-only
-    # filter fed a 6-dim state into a 9-dim normalizer → RuntimeError (size 6 vs 9).
-    # Pure-arm robots have no .vel state keys, so this is a no-op for them.
-    observation_features_hw = {
-        k: v
-        for k, v in all_obs_features.items()
-        if isinstance(v, tuple) or (v is float and k.endswith((".pos", ".vel")))
-    }
-    policy_action_names = getattr(policy_config, "action_feature_names", None)
-    observation_features_hw = _align_state_feature_order(
-        observation_features_hw,
-        list(policy_action_names) if policy_action_names else None,
-    )
-    # Keep both joint-position (.pos) and base-velocity (.vel) action features so
-    # mobile manipulators command the base too (e.g. LeKiwi: 6 arm .pos +
-    # x/y/theta.vel = 9-dim action). Pure-arm robots have no .vel keys, so this is
-    # a no-op for them. Without the .vel keys the base velocities are silently
-    # dropped from dataset_features[ACTION]/ordered_action_keys and the base never moves.
-    action_features_hw = {k: v for k, v in robot.action_features.items() if k.endswith((".pos", ".vel"))}
-
-    # The action side is always needed: sync inference reads action names from
-    # ``dataset_features[ACTION]`` to map policy tensors back to robot actions.
-    action_dataset_features = aggregate_pipeline_dataset_features(
-        pipeline=teleop_action_processor,
-        initial_features=create_initial_features(action=action_features_hw),
-        use_videos=cfg.dataset.video if cfg.dataset else True,
-    )
-    # Observation-side aggregation is needed because of build_dataset_frame
-    observation_dataset_features = aggregate_pipeline_dataset_features(
-        pipeline=robot_observation_processor,
-        initial_features=create_initial_features(observation=observation_features_hw),
-        use_videos=cfg.dataset.video if cfg.dataset else True,
-    )
-    dataset_features = combine_feature_dicts(action_dataset_features, observation_dataset_features)
-    hw_features = hw_to_dataset_features(observation_features_hw, "observation")
-    raw_action_keys = list(action_features_hw.keys())
-    ordered_action_keys = _resolve_action_key_order(
-        list(policy_action_names) if policy_action_names else None,
-        raw_action_keys,
-    )
-
-    # Validate visual features if no rename_map is active
-    rename_map = cfg.rename_map
-    if not rename_map:
-        expected_visuals = {
-            k for k, v in policy_config.input_features.items() if v.type == FeatureType.VISUAL
-        }
-        provided_visuals = {
-            f"observation.images.{k}" for k, v in robot.observation_features.items() if isinstance(v, tuple)
-        }
-        policy_subset = expected_visuals.issubset(provided_visuals)
-        hw_subset = provided_visuals.issubset(expected_visuals)
-        if not (policy_subset or hw_subset):
-            raise ValueError(
-                f"Visual feature mismatch between policy and robot hardware.\n"
-                f"Policy expects: {expected_visuals}\n"
-                f"Robot provides: {provided_visuals}\n"
-                f"Use --rename_map to map camera names, e.g. "
-                f"""--rename_map='{{"observation.images.top": "observation.images.cam0"}}'"""
+    view_mask_runtime = None
+    try:
+        torch_compile_active = cfg.use_torch_compile
+        if cfg.use_torch_compile and policy.type not in ("pi0", "pi05"):
+            torch_compile_active = _wrap_predict_action_chunk_with_torch_compile(
+                policy,
+                backend=cfg.torch_compile_backend,
+                mode=cfg.torch_compile_mode,
             )
 
-    # --- 5. Dataset -------------
-    dataset = None
-    if cfg.dataset is not None:
-        logger.info("Setting up dataset (repo_id=%s)...", cfg.dataset.repo_id)
-        # Strategy-owned columns join the robot/policy features above the resume/create
-        # split, so ``ctx.data.dataset_features`` describes the same schema on both paths.
-        dataset_features.update(cfg.strategy.extra_dataset_features())
-        if cfg.resume:
-            dataset = LeRobotDataset.resume(
-                cfg.dataset.repo_id,
-                root=cfg.dataset.root,
-                batch_encoding_size=cfg.dataset.video_encoding_batch_size,
-                rgb_encoder=cfg.dataset.rgb_encoder,
-                depth_encoder=cfg.dataset.depth_encoder,
-                streaming_encoding=cfg.dataset.streaming_encoding,
-                encoder_queue_maxsize=cfg.dataset.encoder_queue_maxsize,
-                encoder_threads=cfg.dataset.encoder_threads,
-                image_writer_processes=cfg.dataset.num_image_writer_processes,
-                image_writer_threads=cfg.dataset.num_image_writer_threads_per_camera
-                * len(robot.cameras if hasattr(robot, "cameras") else []),
-            )
-        else:
-            repo_name = cfg.dataset.repo_id.split("/", 1)[-1]
-            if not repo_name.startswith("rollout_"):
+        if cfg.use_torch_compile and not torch_compile_active:
+            # RolloutConfig.__post_init__ reloads the policy configuration, so avoid
+            # dataclasses.replace when carrying the effective state downstream.
+            cfg = copy(cfg)
+            cfg.use_torch_compile = False
+
+        # --- 2. Robot-side processors (user-supplied or defaults) --------
+        if (
+            teleop_action_processor is None
+            or robot_action_processor is None
+            or robot_observation_processor is None
+        ):
+            _t, _r, _o = make_default_processors()
+            teleop_action_processor = teleop_action_processor or _t
+            robot_action_processor = robot_action_processor or _r
+            robot_observation_processor = robot_observation_processor or _o
+
+        # --- 3. Hardware (heaviest side-effect, deferred) -----------------
+        logger.info("Connecting robot (%s)...", cfg.robot.type if cfg.robot else "?")
+        robot = make_robot_from_config(cfg.robot)
+        robot.connect()
+        logger.info("Robot connected: %s", robot.name)
+
+        # Store the initial joint positions so we can return to a safe pose on shutdown.
+        initial_obs = robot.get_observation()
+        initial_position = {k: v for k, v in initial_obs.items() if k.endswith(".pos")}
+        logger.info("Captured initial robot position (%d keys)", len(initial_position))
+
+        robot_wrapper = ThreadSafeRobot(robot)
+
+        teleop = None
+        if cfg.teleop is not None:
+            logger.info("Connecting teleoperator (%s)...", cfg.teleop.type if cfg.teleop else "?")
+            teleop = make_teleoperator_from_config(cfg.teleop)
+            teleop.connect()
+            logger.info("Teleoperator connected")
+
+        # TODO(Steven): once Teleoperator motor-control methods are standardised
+        # (``enable_torque`` / ``disable_torque`` / ``write_goal_positions``), gate
+        # the DAgger strategy on their presence here and fail fast with a helpful
+        # message instead of relying on the operator to pre-align the leader by
+        # hand.  See :func:`DAggerStrategy._apply_transition` for the matching
+        # disabled call sites.
+        # if isinstance(cfg.strategy, DAggerStrategyConfig) and teleop is not None:
+        #     required_teleop_methods = ("enable_torque", "disable_torque", "write_goal_positions")
+        #     missing = [m for m in required_teleop_methods if not callable(getattr(teleop, m, None))]
+        #     if missing:
+        #         teleop.disconnect()
+        #         raise ValueError(
+        #             f"DAgger strategy requires a teleoperator with motor control methods "
+        #             f"{required_teleop_methods}. '{type(teleop).__name__}' is missing: {missing}"
+        #         )
+
+        # --- 4. Features + action-key reconciliation ---------------------
+        # TODO(Steven):Only ``.pos`` joint features are routed to the policy as state and as the
+        # action target; velocity and torque channels (when present) are kept in
+        # the raw observation but excluded from the policy-facing tensors.
+        all_obs_features = robot.observation_features
+        # ``observation_features`` values are either a tuple (camera shape) or the
+        # ``float`` type itself used as a sentinel for scalar motor features —
+        # see ``dict[str, type | tuple]`` annotation on ``Robot.observation_features``.
+        # Keep cameras (tuple) plus both joint-position (.pos) and base-velocity (.vel)
+        # scalar state features. LeKiwi's observation.state is 9-dim (6 arm .pos +
+        # x/y/theta.vel) and the policy was trained/normalized on all 9; the old .pos-only
+        # filter fed a 6-dim state into a 9-dim normalizer → RuntimeError (size 6 vs 9).
+        # Pure-arm robots have no .vel state keys, so this is a no-op for them.
+        observation_features_hw = {
+            k: v
+            for k, v in all_obs_features.items()
+            if isinstance(v, tuple) or (v is float and k.endswith((".pos", ".vel")))
+        }
+        policy_action_names = getattr(policy_config, "action_feature_names", None)
+        observation_features_hw = _align_state_feature_order(
+            observation_features_hw,
+            list(policy_action_names) if policy_action_names else None,
+        )
+        # Keep both joint-position (.pos) and base-velocity (.vel) action features so
+        # mobile manipulators command the base too (e.g. LeKiwi: 6 arm .pos +
+        # x/y/theta.vel = 9-dim action). Pure-arm robots have no .vel keys, so this is
+        # a no-op for them. Without the .vel keys the base velocities are silently
+        # dropped from dataset_features[ACTION]/ordered_action_keys and the base never moves.
+        action_features_hw = {k: v for k, v in robot.action_features.items() if k.endswith((".pos", ".vel"))}
+
+        # The action side is always needed: sync inference reads action names from
+        # ``dataset_features[ACTION]`` to map policy tensors back to robot actions.
+        action_dataset_features = aggregate_pipeline_dataset_features(
+            pipeline=teleop_action_processor,
+            initial_features=create_initial_features(action=action_features_hw),
+            use_videos=cfg.dataset.video if cfg.dataset else True,
+        )
+        # Observation-side aggregation is needed because of build_dataset_frame
+        observation_dataset_features = aggregate_pipeline_dataset_features(
+            pipeline=robot_observation_processor,
+            initial_features=create_initial_features(observation=observation_features_hw),
+            use_videos=cfg.dataset.video if cfg.dataset else True,
+        )
+        dataset_features = combine_feature_dicts(action_dataset_features, observation_dataset_features)
+        hw_features = hw_to_dataset_features(observation_features_hw, "observation")
+        # The policy-facing action space is what teleop_action_processor produces (identity
+        # for joint-space policies, ee keys for EE policies), so order actions by
+        # dataset_features[ACTION] names rather than the raw hardware keys. With an identity
+        # teleop processor the two coincide, keeping joint-space rollouts unchanged.
+        policy_action_space_keys = list(dataset_features[ACTION].get("names") or action_features_hw.keys())
+        ordered_action_keys = _resolve_action_key_order(
+            list(policy_action_names) if policy_action_names else None,
+            policy_action_space_keys,
+        )
+
+        # Validate visual features if no rename_map is active
+        rename_map = cfg.rename_map
+        if not rename_map:
+            expected_visuals = {
+                k for k, v in policy_config.input_features.items() if v.type == FeatureType.VISUAL
+            }
+            provided_visuals = {
+                f"observation.images.{k}"
+                for k, v in robot.observation_features.items()
+                if isinstance(v, tuple)
+            }
+            policy_subset = expected_visuals.issubset(provided_visuals)
+            hw_subset = provided_visuals.issubset(expected_visuals)
+            if not (policy_subset or hw_subset):
                 raise ValueError(
-                    "Dataset names for rollout must start with 'rollout_'. "
-                    "Use --dataset.repo_id=<user>/rollout_<name> for policy deployment datasets."
+                    f"Visual feature mismatch between policy and robot hardware.\n"
+                    f"Policy expects: {expected_visuals}\n"
+                    f"Robot provides: {provided_visuals}\n"
+                    f"Use --rename_map to map camera names, e.g. "
+                    f"""--rename_map='{{"observation.images.top": "observation.images.cam0"}}'"""
                 )
-            cfg.dataset.stamp_repo_id()
-            target_video_mb = getattr(cfg.strategy, "target_video_file_size_mb", None)
-            dataset = LeRobotDataset.create(
-                cfg.dataset.repo_id,
-                cfg.dataset.fps,
-                root=cfg.dataset.root,
-                robot_type=robot.name,
-                features=dataset_features,
-                use_videos=cfg.dataset.video,
-                image_writer_processes=cfg.dataset.num_image_writer_processes,
-                image_writer_threads=cfg.dataset.num_image_writer_threads_per_camera
-                * len(robot.cameras if hasattr(robot, "cameras") else []),
-                batch_encoding_size=cfg.dataset.video_encoding_batch_size,
-                rgb_encoder=cfg.dataset.rgb_encoder,
-                depth_encoder=cfg.dataset.depth_encoder,
-                streaming_encoding=cfg.dataset.streaming_encoding,
-                encoder_queue_maxsize=cfg.dataset.encoder_queue_maxsize,
-                encoder_threads=cfg.dataset.encoder_threads,
-                video_files_size_in_mb=target_video_mb,
+
+        # --- 5. Dataset -------------
+        # View ablation's dataset fields must exist before create() or be verified
+        # before resume(), so the plan is resolved here rather than after the engine.
+        view_mask_plan = None
+        if cfg.view_mask.enabled:
+            from .view_mask.config import build_view_mask_plan
+
+            view_mask_plan = build_view_mask_plan(
+                cfg.view_mask,
+                policy_view_keys=[
+                    key
+                    for key, feature in policy_config.input_features.items()
+                    if feature.type is FeatureType.VISUAL
+                ],
+                robot_camera_keys=[
+                    key for key, shape in all_obs_features.items() if isinstance(shape, tuple)
+                ],
+                rename_map=cfg.rename_map,
             )
 
-    if dataset is not None:
-        logger.info("Dataset ready: %s (%d existing episodes)", dataset.repo_id, dataset.num_episodes)
+        dataset = None
+        if cfg.dataset is not None:
+            logger.info("Setting up dataset (repo_id=%s)...", cfg.dataset.repo_id)
+            # Strategy-owned columns join the robot/policy features above the resume/create
+            # split, so ``ctx.data.dataset_features`` describes the same schema on both paths.
+            dataset_features.update(cfg.strategy.extra_dataset_features())
+            if view_mask_plan is not None:
+                dataset_features.update(_view_mask_dataset_features(view_mask_plan.canonical_views))
+            if cfg.resume:
+                dataset = LeRobotDataset.resume(
+                    cfg.dataset.repo_id,
+                    root=cfg.dataset.root,
+                    batch_encoding_size=cfg.dataset.video_encoding_batch_size,
+                    rgb_encoder=cfg.dataset.rgb_encoder,
+                    depth_encoder=cfg.dataset.depth_encoder,
+                    streaming_encoding=cfg.dataset.streaming_encoding,
+                    encoder_queue_maxsize=cfg.dataset.encoder_queue_maxsize,
+                    encoder_threads=cfg.dataset.encoder_threads,
+                    image_writer_processes=cfg.dataset.num_image_writer_processes,
+                    image_writer_threads=cfg.dataset.num_image_writer_threads_per_camera
+                    * len(robot.cameras if hasattr(robot, "cameras") else []),
+                )
+                if view_mask_plan is not None:
+                    _validate_view_mask_dataset(dataset, view_mask_plan.canonical_views)
+            else:
+                repo_name = cfg.dataset.repo_id.split("/", 1)[-1]
+                if not repo_name.startswith("rollout_"):
+                    raise ValueError(
+                        "Dataset names for rollout must start with 'rollout_'. "
+                        "Use --dataset.repo_id=<user>/rollout_<name> for policy deployment datasets."
+                    )
+                cfg.dataset.stamp_repo_id()
+                target_video_mb = getattr(cfg.strategy, "target_video_file_size_mb", None)
+                dataset = LeRobotDataset.create(
+                    cfg.dataset.repo_id,
+                    cfg.dataset.fps,
+                    root=cfg.dataset.root,
+                    robot_type=robot.name,
+                    features=dataset_features,
+                    use_videos=cfg.dataset.video,
+                    image_writer_processes=cfg.dataset.num_image_writer_processes,
+                    image_writer_threads=cfg.dataset.num_image_writer_threads_per_camera
+                    * len(robot.cameras if hasattr(robot, "cameras") else []),
+                    batch_encoding_size=cfg.dataset.video_encoding_batch_size,
+                    rgb_encoder=cfg.dataset.rgb_encoder,
+                    depth_encoder=cfg.dataset.depth_encoder,
+                    streaming_encoding=cfg.dataset.streaming_encoding,
+                    encoder_queue_maxsize=cfg.dataset.encoder_queue_maxsize,
+                    encoder_threads=cfg.dataset.encoder_threads,
+                    video_files_size_in_mb=target_video_mb,
+                )
 
-    # --- 6. Policy pre/post processors (needs dataset stats if any) ---
-    dataset_stats = None
-    if dataset is not None:
-        dataset_stats = rename_stats(
-            dataset.meta.stats,
-            cfg.rename_map,
+        if dataset is not None:
+            logger.info("Dataset ready: %s (%d existing episodes)", dataset.repo_id, dataset.num_episodes)
+
+        # --- 6. Policy pre/post processors (needs dataset stats if any) ---
+        dataset_stats = None
+        if dataset is not None:
+            dataset_stats = rename_stats(
+                dataset.meta.stats,
+                cfg.rename_map,
+            )
+
+        preprocessor, postprocessor = make_pre_post_processors(
+            policy_cfg=policy_config,
+            pretrained_path=cfg.policy.pretrained_path,
+            pretrained_revision=policy_config.pretrained_revision,
+            dataset_stats=dataset_stats,
+            preprocessor_overrides={
+                "device_processor": {"device": cfg.device},
+                "rename_observations_processor": {"rename_map": cfg.rename_map},
+            },
         )
 
-    preprocessor, postprocessor = make_pre_post_processors(
-        policy_cfg=policy_config,
-        pretrained_path=cfg.policy.pretrained_path,
-        pretrained_revision=policy_config.pretrained_revision,
-        dataset_stats=dataset_stats,
-        preprocessor_overrides={
-            "device_processor": {"device": cfg.device},
-            "rename_observations_processor": {"rename_map": cfg.rename_map},
-        },
-    )
-
-    relative_action_step = next(
-        (
-            step
-            for step in getattr(preprocessor, "steps", ())
-            if isinstance(step, RelativeActionsProcessorStep) and step.enabled
-        ),
-        None,
-    )
-    if isinstance(cfg.inference, SyncInferenceConfig) and relative_action_step is not None:
-        raise NotImplementedError(
-            "SyncInferenceEngine does not support policies with relative actions for now."
-            "Use --inference.type=rtc or remove relative action processor steps from the policy pipeline."
+        relative_action_step = next(
+            (
+                step
+                for step in getattr(preprocessor, "steps", ())
+                if isinstance(step, RelativeActionsProcessorStep) and step.enabled
+            ),
+            None,
         )
+        if isinstance(cfg.inference, SyncInferenceConfig) and relative_action_step is not None:
+            raise NotImplementedError(
+                "SyncInferenceEngine does not support policies with relative actions for now."
+                "Use --inference.type=rtc or remove relative action processor steps from the policy pipeline."
+            )
 
-    # --- 7. Inference strategy (needs policy + pre/post + hardware) --
-    logger.info(
-        "Creating inference engine (type=%s)...",
-        cfg.inference.type if hasattr(cfg.inference, "type") else "sync",
-    )
-    task_str = cfg.dataset.single_task if cfg.dataset else cfg.task
-    inference_strategy = create_inference_engine(
-        cfg.inference,
-        policy=policy,
-        preprocessor=preprocessor,
-        postprocessor=postprocessor,
-        robot_wrapper=robot_wrapper,
-        hw_features=hw_features,
-        dataset_features=dataset_features,
-        ordered_action_keys=ordered_action_keys,
-        task=task_str,
-        fps=cfg.fps,
-        device=cfg.device,
-        use_torch_compile=torch_compile_active,
-        compile_warmup_inferences=cfg.compile_warmup_inferences,
-        shutdown_event=shutdown_event,
-    )
+        # --- 6b. View ablation (needs policy features + robot cameras) -----
+        # Built after the pre/post processors exist so the mask step can be spliced
+        # into the checkpoint preprocessor, and before the engine so the engine can
+        # register itself as the transition-flush sink.
+        if view_mask_plan is not None:
+            from .view_mask.setup import build_view_mask_runtime, strategy_hotkey_claims
 
-    # --- 8. Assemble ---------------------------------------------------
-    logger.info("Rollout context assembled successfully")
-    return RolloutContext(
-        runtime=RuntimeContext(cfg=cfg, shutdown_event=shutdown_event),
-        hardware=HardwareContext(
-            robot_wrapper=robot_wrapper, teleop=teleop, initial_position=initial_position
-        ),
-        policy=PolicyContext(
+            view_mask_runtime = build_view_mask_runtime(
+                cfg.view_mask,
+                policy_config,
+                robot_camera_keys=[
+                    key for key, shape in all_obs_features.items() if isinstance(shape, tuple)
+                ],
+                rename_map=cfg.rename_map,
+                dataset_root=str(dataset.root) if dataset is not None else None,
+                key_claims=strategy_hotkey_claims(cfg.strategy, cfg.teleop),
+                interactive=cfg.interactive,
+            )
+            _inject_view_mask_step(preprocessor)
+
+        # --- 7. Inference strategy (needs policy + pre/post + hardware) --
+        logger.info(
+            "Creating inference engine (type=%s)...",
+            cfg.inference.type if hasattr(cfg.inference, "type") else "sync",
+        )
+        task_str = cfg.dataset.single_task if cfg.dataset else cfg.task
+        inference_strategy = create_inference_engine(
+            cfg.inference,
             policy=policy,
             preprocessor=preprocessor,
             postprocessor=postprocessor,
-            inference=inference_strategy,
-        ),
-        processors=ProcessorContext(
-            teleop_action_processor=teleop_action_processor,
-            robot_action_processor=robot_action_processor,
-            robot_observation_processor=robot_observation_processor,
-        ),
-        data=DatasetContext(
-            dataset=dataset,
-            dataset_features=dataset_features,
+            robot_wrapper=robot_wrapper,
             hw_features=hw_features,
+            dataset_features=dataset_features,
             ordered_action_keys=ordered_action_keys,
-        ),
-    )
+            task=task_str,
+            fps=cfg.fps,
+            device=cfg.device,
+            use_torch_compile=torch_compile_active,
+            compile_warmup_inferences=cfg.compile_warmup_inferences,
+            shutdown_event=shutdown_event,
+        )
+        if view_mask_runtime is not None:
+            inference_strategy.attach_view_mask(view_mask_runtime)
+
+        if saliency_manager is not None:
+            # Validation guarantees cfg.inference is RTC when saliency is enabled. Probe the
+            # noise kwarg too: supports_rtc_inference only binds inference_delay /
+            # prev_chunk_left_over, so an RTC-capable policy without a noise parameter must
+            # fail here at build time, not mid-loop inside the RTC thread.
+            if not accepts_noise_injection(policy):
+                raise ValueError(
+                    f"Saliency requires {policy_config.type}.predict_action_chunk to accept a "
+                    "'noise' parameter (the RTC engine injects the flow-matching noise so the "
+                    "explainer can replay the executed chunk exactly). Disable saliency "
+                    "(--saliency.enabled=false) or use a noise-injectable policy."
+                )
+            inference_strategy.saliency_sink = saliency_manager
+            logger.info("Saliency snapshots enabled: RTC engine will inject noise and submit chunk snapshots")
+
+        # --- 8. Assemble ---------------------------------------------------
+        logger.info("Rollout context assembled successfully")
+        return RolloutContext(
+            runtime=RuntimeContext(cfg=cfg, shutdown_event=shutdown_event),
+            hardware=HardwareContext(
+                robot_wrapper=robot_wrapper, teleop=teleop, initial_position=initial_position
+            ),
+            policy=PolicyContext(
+                policy=policy,
+                preprocessor=preprocessor,
+                postprocessor=postprocessor,
+                inference=inference_strategy,
+                saliency=saliency_manager,
+                view_mask=view_mask_runtime,
+            ),
+            processors=ProcessorContext(
+                teleop_action_processor=teleop_action_processor,
+                robot_action_processor=robot_action_processor,
+                robot_observation_processor=robot_observation_processor,
+            ),
+            data=DatasetContext(
+                dataset=dataset,
+                dataset_features=dataset_features,
+                hw_features=hw_features,
+                ordered_action_keys=ordered_action_keys,
+            ),
+        )
+    except Exception:
+        # The recorder thread and its mp4 writers must not outlive a failed build
+        # (half-open videos, and the recorder thread keeps the explainer copy alive).
+        if saliency_manager is not None:
+            logger.warning("Rollout context build failed; stopping saliency recorder")
+            saliency_manager.stop()
+        if view_mask_runtime is not None:
+            logger.warning("Rollout context build failed; stopping View Mask runtime")
+            view_mask_runtime.stop()
+        raise
