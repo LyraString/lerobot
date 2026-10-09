@@ -27,6 +27,7 @@ from unittest.mock import MagicMock
 
 import pytest
 import torch
+import yaml
 
 pytest.importorskip("datasets", reason="datasets is required (install lerobot[dataset])")
 
@@ -250,6 +251,52 @@ def test_rollout_config_passes_policy_pretrained_revision(monkeypatch):
     ]
     assert cfg.policy.pretrained_path == "user/policy"
     assert cfg.policy.pretrained_revision == "cli-sha"
+
+
+@pytest.mark.parametrize("split_args", [False, True])
+def test_rollout_yaml_policy_path_accepts_cli_overrides(tmp_path, monkeypatch, split_args):
+    from lerobot.configs import parser
+    from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
+    from lerobot.rollout import RolloutConfig
+    from tests.mocks.mock_robot import MockRobotConfig
+
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    SmolVLAConfig(device="cpu", n_action_steps=50).save_pretrained(checkpoint)
+    config_path = tmp_path / "rollout.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "robot": {"type": MockRobotConfig.get_choice_name(MockRobotConfig)},
+                "policy": {"path": str(checkpoint), "device": "cpu", "n_action_steps": 5},
+                "duration": 5,
+                "interactive": True,
+                "return_to_initial_position": False,
+            }
+        )
+    )
+    cli_args = (
+        ["--config_path", str(config_path), "--policy.n_action_steps", "10"]
+        if split_args
+        else [f"--config_path={config_path}", "--policy.n_action_steps=10"]
+    )
+    monkeypatch.setattr(sys, "argv", ["lerobot-rollout", *cli_args, "--duration=10", "--interactive=false"])
+    monkeypatch.setattr(parser, "_config_path_args", {})
+    monkeypatch.setattr(parser, "_config_yaml_overrides", {})
+
+    def parse_rollout(cfg: RolloutConfig) -> RolloutConfig:
+        return cfg
+
+    parse_rollout.__annotations__["cfg"] = RolloutConfig
+    cfg = parser.wrap()(parse_rollout)()
+
+    assert cfg.policy.type == "smolvla"
+    assert cfg.policy.pretrained_path == str(checkpoint)
+    assert cfg.policy.n_action_steps == 10
+    assert cfg.policy.device == "cpu"
+    assert cfg.duration == 10
+    assert not cfg.interactive
+    assert not cfg.return_to_initial_position
 
 
 @pytest.mark.parametrize("multiplier", [0, -1])

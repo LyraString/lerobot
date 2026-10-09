@@ -3129,6 +3129,7 @@ all = [
     { name = "torchcodec", marker = "(platform_machine == 'arm64' and sys_platform == 'darwin') or (platform_machine == 'AMD64' and sys_platform == 'linux') or (platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'arm64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or sys_platform == 'win32'" },
     { name = "torchdiffeq" },
     { name = "transformers" },
+    { name = "ur-rtde" },
     { name = "wandb" },
 ]
 aloha = [
@@ -3491,6 +3492,11 @@ unitree-g1 = [
     { name = "pyserial" },
     { name = "pyzmq" },
 ]
+ur5 = [
+    { name = "pyrealsense2", marker = "sys_platform != 'darwin'" },
+    { name = "pyrealsense2-macosx", marker = "sys_platform == 'darwin'" },
+    { name = "ur-rtde" },
+]
 video-benchmark = [
     { name = "pandas" },
     { name = "scikit-image" },
@@ -3601,6 +3607,7 @@ requires-dist = [
     { name = "lerobot", extras = ["hilserl"], marker = "extra == 'all'" },
     { name = "lerobot", extras = ["hopejr"], marker = "extra == 'all'" },
     { name = "lerobot", extras = ["intelrealsense"], marker = "extra == 'all'" },
+    { name = "lerobot", extras = ["intelrealsense"], marker = "extra == 'ur5'" },
     { name = "lerobot", extras = ["kinematics"], marker = "extra == 'all'" },
     { name = "lerobot", extras = ["lancedb"], marker = "extra == 'all'" },
     { name = "lerobot", extras = ["lancedb"], marker = "extra == 'lancedb-convert'" },
@@ -3679,6 +3686,7 @@ requires-dist = [
     { name = "lerobot", extras = ["transformers-dep"], marker = "extra == 'vla-jepa'" },
     { name = "lerobot", extras = ["transformers-dep"], marker = "extra == 'wallx'" },
     { name = "lerobot", extras = ["transformers-dep"], marker = "extra == 'xvla'" },
+    { name = "lerobot", extras = ["ur5"], marker = "extra == 'all'" },
     { name = "lerobot", extras = ["video-benchmark"], marker = "extra == 'all'" },
     { name = "lerobot", extras = ["viz"], marker = "extra == 'all'" },
     { name = "lerobot", extras = ["viz"], marker = "extra == 'core-scripts'" },
@@ -3745,9 +3753,10 @@ requires-dist = [
     { name = "torchvision", marker = "sys_platform == 'linux'", specifier = ">=0.22.0,<0.27.0", index = "https://download.pytorch.org/whl/cu128" },
     { name = "tqdm", specifier = ">=4.66.0,<5.0.0" },
     { name = "transformers", marker = "extra == 'transformers-dep'", specifier = ">=5.4.0,<5.6.0" },
+    { name = "ur-rtde", marker = "extra == 'ur5'", specifier = "==1.6.3" },
     { name = "wandb", marker = "extra == 'training'", specifier = ">=0.24.0,<0.28.0" },
 ]
-provides-extras = ["lancedb", "lancedb-convert", "dataset", "training", "hardware", "viz", "core-scripts", "evaluation", "dataset-viz", "av-dep", "pygame-dep", "placo-dep", "transformers-dep", "grpcio-dep", "accelerate-dep", "can-dep", "peft-dep", "scipy-dep", "diffusers-dep", "qwen-vl-utils-dep", "matplotlib-dep", "pyserial-dep", "deepdiff-dep", "pynput-dep", "pyzmq-dep", "motorbridge-dep", "motorbridge-smart-servo-dep", "timm-dep", "feetech", "dynamixel", "damiao", "robstride", "openarms", "gamepad", "hopejr", "lekiwi", "unitree-g1", "reachy2", "rebot", "kinematics", "intelrealsense", "phone", "diffusion", "wallx", "pi", "molmoact2", "smolvla", "multi-task-dit", "groot", "sarm", "robometer", "topreward", "xvla", "eo1", "fastwam", "evo1", "hilserl", "vla-jepa", "lingbot-va", "async", "peft", "annotations", "dev", "notebook", "test", "video-benchmark", "aloha", "pusht", "libero", "metaworld", "all"]
+provides-extras = ["lancedb", "lancedb-convert", "dataset", "training", "hardware", "viz", "core-scripts", "evaluation", "dataset-viz", "av-dep", "pygame-dep", "placo-dep", "transformers-dep", "grpcio-dep", "accelerate-dep", "can-dep", "peft-dep", "scipy-dep", "diffusers-dep", "qwen-vl-utils-dep", "matplotlib-dep", "pyserial-dep", "deepdiff-dep", "pynput-dep", "pyzmq-dep", "motorbridge-dep", "motorbridge-smart-servo-dep", "timm-dep", "feetech", "dynamixel", "damiao", "robstride", "openarms", "gamepad", "hopejr", "lekiwi", "unitree-g1", "reachy2", "rebot", "kinematics", "intelrealsense", "ur5", "phone", "diffusion", "wallx", "pi", "molmoact2", "smolvla", "multi-task-dit", "groot", "sarm", "robometer", "topreward", "xvla", "eo1", "fastwam", "evo1", "hilserl", "vla-jepa", "lingbot-va", "async", "peft", "annotations", "dev", "notebook", "test", "video-benchmark", "aloha", "pusht", "libero", "metaworld", "all"]
 
 [[package]]
 name = "lerobot-lancedb"
@@ -7266,6 +7275,17 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/36/9d/a40411a475e7d4838994b7f6bcc6bfca9acc5b119ce3a7503608c4428b49/u-msgpack-python-2.8.0.tar.gz", hash = "sha256:b801a83d6ed75e6df41e44518b4f2a9c221dc2da4bcd5380e3a0feda520bc61a", size = 18167, upload-time = "2023-05-18T09:28:12.187Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/b1/5e/512aeb40fd819f4660d00f96f5c7371ee36fc8c6b605128c5ee59e0b28c6/u_msgpack_python-2.8.0-py2.py3-none-any.whl", hash = "sha256:1d853d33e78b72c4228a2025b4db28cda81214076e5b0422ed0ae1b1b2bb586a", size = 10590, upload-time = "2023-05-18T09:28:10.323Z" },
+]
+
+[[package]]
+name = "ur-rtde"
+version = "1.6.3"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/0e/97/b14f774cfd63a46ca80cfadd2c24704a7eae2b4d26fc18cc7c8783c4ca8e/ur_rtde-1.6.3.tar.gz", hash = "sha256:30bbbb5b9c98c49a3b53be2819b80f00c1f76dc08b99e3ed064e6a190d29bf81", size = 2820425, upload-time = "2026-03-13T13:41:04.05Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/67/ed/b6ee131f29a12d6a4b49d7a14f69905fb81dbae1fc9fe4b48f860c214f08/ur_rtde-1.6.3-cp312-cp312-manylinux_2_17_i686.manylinux2014_i686.whl", hash = "sha256:d6985014db08e0c43d7b64db95bdad14349dd39b9bdbcaf88f3b40596c549544", size = 4992312, upload-time = "2026-03-13T13:40:09.316Z" },
+    { url = "https://files.pythonhosted.org/packages/55/3c/18013fc90305c3aad66db84db97736fc9af5603589948049a75137ec9c59/ur_rtde-1.6.3-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:b075ae3cb4aae5c93d7a1ba2d31890dfad5ed2da7458a3e78037e4bb88bc23e8", size = 4920152, upload-time = "2026-03-13T13:40:11.97Z" },
+    { url = "https://files.pythonhosted.org/packages/82/d8/f66f030d0487e1221580ac969be20d3aa1b182fee15502cacd4e0a59e6e0/ur_rtde-1.6.3-cp312-cp312-win_amd64.whl", hash = "sha256:b19a2d4564290398673f5040bd0e84e5f4de96920577dbe4cea02bf7351896ff", size = 2570841, upload-time = "2026-03-13T13:40:14.382Z" },
 ]
 
 [[package]]

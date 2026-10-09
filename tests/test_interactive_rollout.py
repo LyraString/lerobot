@@ -1318,6 +1318,22 @@ def _running_rtc_engine(rtc_queue_threshold: int = 30, chunk_len: int = 10):
         engine.stop()
 
 
+def test_rtc_engine_serves_queued_actions_while_next_chunk_is_being_inferred():
+    with _running_rtc_engine(rtc_queue_threshold=30, chunk_len=50) as (engine, policy):
+        policy.allow_one_inference()
+        assert _wait_for(lambda: engine.action_queue.qsize() > 30)
+        while engine.action_queue.qsize() > 30:
+            assert engine.get_action(None) is not None
+        assert _wait_for(policy.in_inference.is_set)
+
+        remaining = engine.action_queue.qsize()
+        for index in range(5):
+            assert engine.get_action(None) is not None
+            assert policy.in_inference.is_set()
+            assert policy.predicted_tasks == ["task A"]
+            assert engine.action_queue.qsize() == remaining - index - 1
+
+
 def test_rtc_engine_dispatched_task_tracks_chunk_provenance_across_set_task():
     """``dispatched_task`` may only advance to the new instruction when an action from a
     chunk conditioned on it is popped — that is what frame provenance rests on."""
