@@ -266,7 +266,7 @@ HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 uv run --no-sync python \
   examples/ur5_real/eval_policy_offline.py
 ```
 
-默认读取 `./policy` 与采集仓库的 `dual_ur5_demo_coloured`，使用 checkpoint 保存的
+默认读取 `./policy/SmolVLA` 与采集仓库的 `dual_ur5_demo_coloured`，使用 checkpoint 保存的
 processor、官方 `LeRobotDataset` 和 `predict_action_chunk()`，关闭 RTC 前缀引导以测量
 策略自身的预测基线。每条 episode 均匀取五个阶段，每个样本预测完整 50 步；
 示教动作不会送入策略输入，统计排除超出 episode 末尾的补齐帧。

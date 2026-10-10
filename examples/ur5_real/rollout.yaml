@@ -35,7 +35,7 @@ robot:
       width: 640
       height: 480
 policy:
-  path: ./policy
+  path: ./policy/SmolVLA
   device: cuda
 strategy:
   type: base

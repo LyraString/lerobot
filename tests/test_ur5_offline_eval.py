@@ -1,7 +1,36 @@
+import sys
+from pathlib import Path
+from unittest.mock import MagicMock
+
 import numpy as np
 import pytest
+import yaml
 
+from examples.ur5_real import eval_policy_offline
 from examples.ur5_real.eval_policy_offline import summarize_errors
+
+
+def test_rollout_defaults_to_relocated_smolvla_checkpoint():
+    config = yaml.safe_load(Path("examples/ur5_real/rollout.yaml").read_text())
+    assert config["policy"]["path"] == "./policy/SmolVLA"
+
+
+@pytest.mark.parametrize(
+    "arguments,expected_path",
+    [
+        ([], Path("policy/SmolVLA")),
+        (["--policy-path=custom/checkpoint"], Path("custom/checkpoint")),
+    ],
+)
+def test_offline_eval_checkpoint_default_and_override(monkeypatch, arguments, expected_path):
+    monkeypatch.setattr(sys, "argv", ["eval_policy_offline.py", *arguments])
+    load_config = MagicMock(side_effect=RuntimeError("Stop before loading checkpoint"))
+    monkeypatch.setattr(eval_policy_offline.PreTrainedConfig, "from_pretrained", load_config)
+
+    with pytest.raises(RuntimeError, match="Stop before loading checkpoint"):
+        eval_policy_offline.main()
+
+    load_config.assert_called_once_with(expected_path)
 
 
 def test_chunk_errors_exclude_padded_frames_and_separate_units():

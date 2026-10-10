@@ -62,7 +62,7 @@ def save_views(sample, keys, path):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--policy-path", type=Path, default=Path("policy"))
+    parser.add_argument("--policy-path", type=Path, default=Path("policy/SmolVLA"))
     parser.add_argument(
         "--dataset-root",
         type=Path,
