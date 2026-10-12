@@ -1,0 +1,68 @@
+{
+  "dataset": {
+    "repo_id": "local/dual-ur5-demo-coloured",
+    "root": "/home/idiot/zhj/ler/datasets/dual_ur5_demo_coloured",
+    "video_backend": "torchcodec",
+    "eval_split": 0.1
+  },
+  "policy": {
+    "type": "pi05",
+    "pretrained_path": "lerobot/pi05_base",
+    "device": "cuda",
+    "dtype": "bfloat16",
+    "use_openpi_precision": true,
+    "native_lora": {
+      "rank": 128,
+      "alpha": 128.0,
+      "dropout": 0.0,
+      "init_std": 0.01
+    },
+    "chunk_size": 50,
+    "n_action_steps": 25,
+    "empty_cameras": 0,
+    "train_expert_only": false,
+    "freeze_vision_encoder": false,
+    "gradient_checkpointing": true,
+    "use_relative_actions": false,
+    "normalization_mapping": {
+      "ACTION": "QUANTILES",
+      "STATE": "QUANTILES",
+      "VISUAL": "IDENTITY"
+    },
+    "optimizer_lr": 0.0001,
+    "optimizer_weight_decay": 1e-10,
+    "optimizer_grad_clip_norm": 1.0,
+    "scheduler_warmup_steps": 666,
+    "scheduler_decay_steps": 20000,
+    "scheduler_decay_lr": 0.00001,
+    "push_to_hub": false
+  },
+  "peft": null,
+  "accelerator": {
+    "mixed_precision": "bf16",
+    "gradient_accumulation": {
+      "steps": 2
+    }
+  },
+  "ema": {
+    "enable": false
+  },
+  "batch_size": 8,
+  "num_workers": 8,
+  "steps": 20000,
+  "eval_steps": 2000,
+  "max_eval_samples": 0,
+  "log_freq": 200,
+  "save_freq": 4000,
+  "seed": 42,
+  "preserve_pretrained_processor_stats": false,
+  "output_dir": "outputs/train/pi05_base_dual_ur5_native_lora_r128_b8_acc2",
+  "job_name": "pi05_base_dual_ur5_native_lora_r128_b8_acc2",
+  "wandb": {
+    "enable": true,
+    "mode": "online",
+    "entity": "lyrastring-zhejiang-university",
+    "project": "pi05-dual-ur5",
+    "disable_artifact": true
+  }
+}

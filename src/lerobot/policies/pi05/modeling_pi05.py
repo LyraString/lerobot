@@ -15,6 +15,7 @@
 # limitations under the License.
 
 import builtins
+import json
 import logging
 from collections import deque
 from pathlib import Path
@@ -64,6 +65,7 @@ from ..common.vla_utils import (
 from ..pretrained import PreTrainedPolicy, T
 from ..rtc.modeling_rtc import RTCProcessor
 from .configuration_pi05 import DEFAULT_IMAGE_SIZE, PI05Config
+from .lora import apply_native_lora
 from .memory import encode_video_with_mem, sample_observation_history
 
 
@@ -296,12 +298,14 @@ class PaliGemmaWithExpertModel(
         image_size: int = DEFAULT_IMAGE_SIZE,
         freeze_vision_encoder: bool = False,
         train_expert_only: bool = False,
+        use_openpi_precision: bool = False,
     ):
         if use_adarms is None:
             use_adarms = [False, False]
         super().__init__()
         self.freeze_vision_encoder = freeze_vision_encoder
         self.train_expert_only = train_expert_only
+        self.use_openpi_precision = use_openpi_precision
 
         vlm_config_hf = CONFIG_MAPPING["paligemma"]()
         vlm_config_hf._vocab_size = 257152  # noqa: SLF001
@@ -353,8 +357,8 @@ class PaliGemmaWithExpertModel(
         else:
             raise ValueError(f"Invalid precision: {precision}")
 
-        # Keep full vision path in float32 so we never toggle (toggle causes optimizer
-        # "same dtype" error). Saves memory vs full float32; more memory than only 3 params.
+        # Preserve the legacy full-FP32 vision path unless OpenPI precision is selected.
+        # Parameter dtypes stay fixed throughout forward/backward and optimizer updates.
         params_to_keep_float32 = [
             "vision_tower",
             "multi_modal_projector",
@@ -362,6 +366,15 @@ class PaliGemmaWithExpertModel(
             "post_attention_layernorm",
             "model.norm",
         ]
+        if self.use_openpi_precision:
+            params_to_keep_float32 = [
+                "vision_tower.vision_model.embeddings.patch_embedding.weight",
+                "vision_tower.vision_model.embeddings.patch_embedding.bias",
+                "vision_tower.vision_model.embeddings.position_embedding.weight",
+                "input_layernorm",
+                "post_attention_layernorm",
+                "model.norm",
+            ]
 
         for name, param in self.named_parameters():
             if any(selector in name for selector in params_to_keep_float32):
@@ -391,7 +404,7 @@ class PaliGemmaWithExpertModel(
         frame_mask: torch.Tensor | None = None,
         temporal_attention_every: int = 4,
     ):
-        # Vision tower and multi_modal_projector are kept in float32 (params_to_keep_float32).
+        # Patch embeddings consume FP32 images; OpenPI mode casts their output for the encoder.
         out_dtype = image.dtype
         if image.dtype != torch.float32:
             image = image.to(torch.float32)
@@ -405,6 +418,16 @@ class PaliGemmaWithExpertModel(
                 frame_mask,
                 temporal_attention_every=temporal_attention_every,
             )
+            features = self.paligemma.model.multi_modal_projector(features)
+        elif self.use_openpi_precision:
+            # OpenPI casts FP32 patch/position embeddings before the BF16 SigLIP encoder.
+            # Keep this local rather than patching the installed Transformers package.
+            vision_model = self.paligemma.model.vision_tower.vision_model
+            hidden_states = vision_model.embeddings(image)
+            encoder_dtype = vision_model.encoder.layers[0].self_attn.q_proj.weight.dtype
+            hidden_states = hidden_states.to(dtype=encoder_dtype)
+            hidden_states = vision_model.encoder(inputs_embeds=hidden_states).last_hidden_state
+            features = vision_model.post_layernorm(hidden_states)
             features = self.paligemma.model.multi_modal_projector(features)
         else:
             image_outputs = self.paligemma.model.get_image_features(image)
@@ -543,6 +566,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             image_size=config.image_resolution[0],
             freeze_vision_encoder=config.freeze_vision_encoder,
             train_expert_only=config.train_expert_only,
+            use_openpi_precision=config.use_openpi_precision,
         )
 
         self.action_in_proj = nn.Linear(config.max_action_dim, action_expert_config.width)
@@ -555,6 +579,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             if config.use_proprioceptive_memory
             else None
         )
+        apply_native_lora(self, config)
 
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
@@ -974,19 +999,21 @@ class PI05Policy(PreTrainedPolicy):
                 resolved_file = cached_file(
                     pretrained_name_or_path,
                     "model.safetensors",
-                    cache_dir=kwargs.get("cache_dir"),
-                    force_download=kwargs.get("force_download", False),
-                    resume_download=kwargs.get("resume_download"),
-                    proxies=kwargs.get("proxies"),
-                    token=kwargs.get("token"),
-                    revision=kwargs.get("revision"),
-                    local_files_only=kwargs.get("local_files_only", False),
+                    cache_dir=cache_dir,
+                    force_download=force_download,
+                    resume_download=resume_download,
+                    proxies=proxies,
+                    token=token,
+                    revision=revision,
+                    local_files_only=local_files_only,
                 )
                 from safetensors.torch import load_file
 
                 original_state_dict = load_file(resolved_file)
                 print("✓ Loaded state dict from model.safetensors")
             except Exception as e:
+                if model.config.native_lora is not None:
+                    raise
                 print(f"Could not load state dict from remote files: {e}")
                 print("Returning model without loading pretrained weights")
                 return model
@@ -1009,7 +1036,20 @@ class PI05Policy(PreTrainedPolicy):
             if remap_count > 0:
                 print(f"Remapped {remap_count} state dict keys")
 
-            remapped_state_dict = model._prepare_pretrained_state_dict(remapped_state_dict)
+            initialize_lora = False
+            if model.config.native_lora is not None:
+                # A weights-only OpenPI base is valid. Native checkpoints written by
+                # save_pretrained include config.json beside the same weight snapshot.
+                source_config_file = Path(resolved_file).parent / "config.json"
+                source_native_lora = None
+                if source_config_file.is_file():
+                    with source_config_file.open() as f:
+                        source_native_lora = json.load(f).get("native_lora")
+                has_adapters = any(key.endswith((".lora_a", ".lora_b")) for key in remapped_state_dict)
+                initialize_lora = source_native_lora is None and not has_adapters
+            remapped_state_dict = model._prepare_pretrained_state_dict(
+                remapped_state_dict, initialize_lora=initialize_lora
+            )
 
             # Load the remapped state dict into the model
             missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=strict)
@@ -1038,11 +1078,21 @@ class PI05Policy(PreTrainedPolicy):
                 print("All keys loaded successfully!")
 
         except Exception as e:
+            if model.config.native_lora is not None:
+                raise
             print(f"Warning: Could not load state dict: {e}")
 
         return model
 
-    def _prepare_pretrained_state_dict(self, state_dict: dict[str, Tensor]) -> dict[str, Tensor]:
+    def _prepare_pretrained_state_dict(
+        self, state_dict: dict[str, Tensor], *, initialize_lora: bool = False
+    ) -> dict[str, Tensor]:
+        if initialize_lora:
+            # A plain base has no adapters. A native checkpoint must contain every
+            # adapter key; strict loading must not hide an incomplete checkpoint.
+            for key, value in self.state_dict().items():
+                if key.endswith((".lora_a", ".lora_b")):
+                    state_dict.setdefault(key, value)
         # MEM's continuous proprioceptive projection is new relative to
         # lerobot/pi05_base. Preserve its fresh initialization on first load,
         # while loading learned values from subsequent MEM checkpoints.
@@ -1054,6 +1104,11 @@ class PI05Policy(PreTrainedPolicy):
             ):
                 state_dict.setdefault(key, current[key])
         return state_dict
+
+    def _validate_peft_config(self, peft_config) -> None:
+        if self.config.native_lora is not None:
+            raise ValueError("PI05 native LoRA cannot be wrapped with PEFT")
+        super()._validate_peft_config(peft_config)
 
     def _fix_pytorch_state_dict_keys(
         self, state_dict, model_config

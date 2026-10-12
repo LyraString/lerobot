@@ -288,11 +288,12 @@ class TrainPipelineConfig(HubMixin):
             )
 
         active_cfg = self.trainable_config
-        if self.preserve_pretrained_processor_stats:
-            if self.is_reward_model_training or active_cfg.pretrained_path is None:
-                raise ValueError(
-                    "preserve_pretrained_processor_stats requires a pretrained --policy.path."
-                )
+        if self.peft is not None and getattr(active_cfg, "native_lora", None) is not None:
+            raise ValueError("PI05 native_lora and --peft cannot be enabled together; set peft=null")
+        if self.preserve_pretrained_processor_stats and (
+            self.is_reward_model_training or active_cfg.pretrained_path is None
+        ):
+            raise ValueError("preserve_pretrained_processor_stats requires a pretrained --policy.path.")
         if self.rename_map and active_cfg.pretrained_path is None:
             raise ValueError(
                 "`rename_map` requires a pretrained policy checkpoint. "

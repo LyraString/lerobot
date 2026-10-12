@@ -218,6 +218,8 @@ def encode_video_with_mem(
 
     flat_pixels = pixel_values.reshape(batch_size * num_frames, channels, height, width)
     hidden_states = vision_model.embeddings(flat_pixels)
+    _validate_siglip_layer(layers[0], layer_index=0)
+    hidden_states = hidden_states.to(dtype=layers[0].self_attn.q_proj.weight.dtype)
     num_patches, hidden_size = hidden_states.shape[1:]
     hidden_states = hidden_states.reshape(batch_size, num_frames, num_patches, hidden_size)
     temporal_positions = temporal_sinusoidal_embedding(

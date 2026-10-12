@@ -25,6 +25,26 @@ from ..rtc.configuration_rtc import RTCConfig
 DEFAULT_IMAGE_SIZE = 224
 
 
+@dataclass
+class PI05NativeLoRAConfig:
+    """Native Transformer LoRA settings, following OpenPI issue #842."""
+
+    rank: int = 16
+    alpha: float = 16.0
+    dropout: float = 0.0
+    init_std: float = 0.01
+
+    def __post_init__(self):
+        if self.rank < 1:
+            raise ValueError("native_lora.rank must be positive")
+        if self.alpha <= 0:
+            raise ValueError("native_lora.alpha must be positive")
+        if not 0 <= self.dropout < 1:
+            raise ValueError("native_lora.dropout must be in [0, 1)")
+        if self.init_std <= 0:
+            raise ValueError("native_lora.init_std must be positive")
+
+
 @PreTrainedConfig.register_subclass("pi05")
 @dataclass
 class PI05Config(PreTrainedConfig):
@@ -104,6 +124,11 @@ class PI05Config(PreTrainedConfig):
     # Finetuning settings
     freeze_vision_encoder: bool = False  # Freeze only the vision encoder
     train_expert_only: bool = False  # Freeze entire VLM, train only action expert and projections
+    # Optional native LoRA: no PEFT wrappers or copies of fully trainable modules.
+    native_lora: PI05NativeLoRAConfig | None = None
+    # OpenPI BF16 policy: retain only vision embeddings and selected norms in FP32.
+    # False preserves the existing full-FP32 vision path and old checkpoint behavior.
+    use_openpi_precision: bool = False
 
     # Optimizer settings: see openpi `AdamW`
     optimizer_lr: float = 2.5e-5  # see openpi `CosineDecaySchedule: peak_lr`
@@ -141,6 +166,9 @@ class PI05Config(PreTrainedConfig):
 
         if self.dtype not in ["bfloat16", "float32"]:
             raise ValueError(f"Invalid dtype: {self.dtype}")
+
+        if self.native_lora is not None and self.use_peft:
+            raise ValueError("PI05 native_lora cannot be combined with use_peft")
 
         if self.memory_frames < 1:
             raise ValueError("memory_frames must be at least 1")
