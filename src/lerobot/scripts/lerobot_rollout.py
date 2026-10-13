@@ -33,6 +33,7 @@ Inference backends
 ------------------
     --inference.type=sync      One policy call per control tick (default)
     --inference.type=rtc       Real-Time Chunking for slow VLA models
+    --inference.type=remote    Policy served by lerobot-policy-server (see remote inference docs)
 
 Usage examples
 --------------
@@ -147,17 +148,6 @@ Usage examples
         --dataset.single_task="patrol" \\
         --resume=true
 
-    # View ablation — black out a view for the policy while the dataset and the
-    # operator keep the original pixels. F1/F2/F3 toggle views at runtime.
-    lerobot-rollout \\
-        --strategy.type=base \\
-        --policy.path=user/my_policy \\
-        --robot.type=bi_openarm_follower \\
-        --robot.port=/dev/ttyACM0 \\
-        --task="fold the shirt" \\
-        --view_mask.enabled=true \\
-        --view_mask.initial_views='["left_wrist"]'
-
     # Rollout with custom video encoding parameters
     lerobot-rollout \\
         --strategy.type=base \\
@@ -175,6 +165,9 @@ Usage examples
 """
 
 import logging
+import threading
+from collections.abc import Callable
+from typing import cast
 
 from lerobot.cameras.opencv import OpenCVCameraConfig  # noqa: F401
 from lerobot.cameras.realsense import RealSenseCameraConfig  # noqa: F401
@@ -186,7 +179,6 @@ from lerobot.robots import (  # noqa: F401
     bi_openarm_follower,
     bi_rebot_b601_follower,
     bi_so_follower,
-    dual_ur5_cb3,
     earthrover_mini_plus,
     hope_jr,
     koch_follower,
@@ -222,9 +214,8 @@ from lerobot.teleoperators import (  # noqa: F401
     so_leader,
     unitree_g1,
 )
-from lerobot.utils.import_utils import register_third_party_plugins
+from lerobot.utils import init_logging, register_third_party_plugins
 from lerobot.utils.process import ProcessSignalHandler
-from lerobot.utils.utils import init_logging
 from lerobot.utils.visualization_utils import init_visualization, shutdown_visualization
 
 logger = logging.getLogger(__name__)
@@ -233,7 +224,7 @@ logger = logging.getLogger(__name__)
 @parser.wrap()
 def rollout(cfg: RolloutConfig):
     """Main entry point for policy deployment."""
-    init_logging()
+    init_logging(console_level=cfg.inference.log_level)
 
     if cfg.display_data:
         logger.info(
@@ -246,6 +237,8 @@ def rollout(cfg: RolloutConfig):
 
     signal_handler = ProcessSignalHandler(use_threads=True, display_pid=False)
     shutdown_event = signal_handler.shutdown_event
+    if not isinstance(shutdown_event, threading.Event):
+        raise RuntimeError("ProcessSignalHandler(use_threads=True) must hand out a threading.Event")
     if cfg.interactive:
         # /reset and /stop end the control loop via the local flag; process signals still
         # propagate through the parent event.
@@ -255,12 +248,6 @@ def rollout(cfg: RolloutConfig):
     ctx = build_rollout_context(cfg, shutdown_event)
 
     strategy = create_strategy(cfg.strategy)
-    if ctx.policy.view_mask is not None:
-        # Attach the saliency recorder to the View Mask timeline so superseded
-        # revisions are filtered as provenance, not counted as failures.
-        if ctx.policy.saliency is not None:
-            ctx.policy.saliency.set_view_mask(ctx.policy.view_mask)
-        ctx.policy.view_mask.start()
     logger.info("Rollout strategy: %s", cfg.strategy.type)
     logger.info(
         "Robot: %s | FPS: %.0f | Duration: %s",
@@ -269,36 +256,34 @@ def rollout(cfg: RolloutConfig):
         f"{cfg.duration}s" if cfg.duration > 0 else "infinite",
     )
 
+    session: InteractiveSession | None = None
     try:
         strategy.setup(ctx)
         if cfg.interactive:
             logger.info("Rollout setup complete — starting interactive session (robot idle until /start)")
-            InteractiveSession(strategy, ctx).run()
+            session = InteractiveSession(strategy, ctx)
+            session.run()
         else:
             logger.info("Rollout setup complete, starting rollout...")
             strategy.run(ctx)
     except KeyboardInterrupt:
         logger.info("Interrupted by user")
     finally:
-        # The hotkey listener and the event sidecar stop before the hardware teardown:
-        # a keypress during a several-second return move would otherwise queue a
-        # transition nobody is left to honour.
-        if ctx.policy.view_mask is not None:
-            ctx.policy.view_mask.stop()
         strategy.teardown(ctx)
-        if ctx.policy.saliency is not None:
-            logger.info("Finalizing saliency overlay videos...")
-            ctx.policy.saliency.stop()
         if cfg.display_data:
             shutdown_visualization(cfg.display_mode)
 
+    failure = session.controller if session is not None else ctx.policy.inference
+    if failure.failed:
+        logger.error("Rollout ended by a terminal fault: %s", failure.failure_traceback)
+        raise SystemExit(1)
     logger.info("Rollout finished")
 
 
-def main():
+def main() -> None:
     """CLI entry point for ``lerobot-rollout``."""
     register_third_party_plugins()
-    rollout()
+    cast(Callable[[], None], rollout)()
 
 
 if __name__ == "__main__":

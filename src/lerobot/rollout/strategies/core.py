@@ -19,22 +19,31 @@ from __future__ import annotations
 import abc
 import contextlib
 import logging
+import math
+from collections.abc import Callable, Iterator
 from typing import TYPE_CHECKING
 
+from lerobot.configs import DatasetRecordConfig
+from lerobot.datasets import LeRobotDataset
 from lerobot.datasets.utils import DEFAULT_VIDEO_FILE_SIZE_IN_MB
-from lerobot.utils.action_interpolator import ActionInterpolator
-from lerobot.utils.constants import OBS_STR
+from lerobot.inference import InferenceEngine, commit_action, next_interpolated_action
+from lerobot.lerobot_types import RobotObservation
+from lerobot.teleoperators import Teleoperator
+from lerobot.utils import OBS_STR, ActionInterpolator
 from lerobot.utils.cycle_timer import CycleTimer
 from lerobot.utils.feature_utils import build_dataset_frame
 from lerobot.utils.robot_utils import precise_sleep
 from lerobot.utils.visualization_utils import log_visualization_data
 
-from ..inference import InferenceEngine
-from ..view_mask.telemetry import log_status as log_view_mask_status
-
 if TYPE_CHECKING:
-    from ..configs import RolloutStrategyConfig
-    from ..context import HardwareContext, ProcessorContext, RolloutContext, RuntimeContext
+    from ..configs import RolloutConfig, RolloutStrategyConfig
+    from ..context import (
+        DatasetContext,
+        HardwareContext,
+        ProcessorContext,
+        RolloutContext,
+        RuntimeContext,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +74,9 @@ class RolloutStrategy(abc.ABC):
 
     One-shot strategies (``supports_interactive = False``, the default) are
     free to finalize on ``run()`` exit, e.g. via ``VideoEncodingManager``.
+
+    Every autonomous motor tick must use :func:`send_next_action`, including
+    ticks spent holding or interpolating; see its dispatch contract below.
     """
 
     def __init__(self, config: RolloutStrategyConfig) -> None:
@@ -72,11 +84,7 @@ class RolloutStrategy(abc.ABC):
         self._engine: InferenceEngine | None = None
         self._interpolator: ActionInterpolator | None = None
         self._warmup_flushed: bool = False
-        self._cached_obs_processed: dict | None = None
-        # View ablation is inert unless _attach_view_mask finds a runtime on the
-        # policy context; --view_mask.enabled=false leaves these None throughout.
-        self._view_mask = None
-        self._view_mask_dataset = None
+        self._cached_obs_processed: RobotObservation | None = None
 
     def _init_engine(self, ctx: RolloutContext) -> None:
         """Attach the inference engine and action interpolator, then start the backend.
@@ -94,6 +102,45 @@ class RolloutStrategy(abc.ABC):
         self._warmup_flushed = False
         logger.info("Inference engine started")
 
+    def _require_engine(self) -> InferenceEngine:
+        """The inference engine attached by :meth:`_init_engine`."""
+        if self._engine is None:
+            raise RuntimeError(f"{type(self).__name__}: inference engine not attached; call setup() first")
+        return self._engine
+
+    def _require_interpolator(self) -> ActionInterpolator:
+        """The action interpolator created by :meth:`_init_engine`."""
+        if self._interpolator is None:
+            raise RuntimeError(f"{type(self).__name__}: action interpolator not attached; call setup() first")
+        return self._interpolator
+
+    def _require_dataset_cfg(self, cfg: RolloutConfig) -> DatasetRecordConfig:
+        """The ``--dataset.*`` config a recording strategy records with; ``RolloutConfig`` enforces ``dataset_mode = "required"``."""
+        if cfg.dataset is None:
+            raise RuntimeError(
+                f"{type(self).__name__}: no dataset config; a recording strategy must declare "
+                'dataset_mode = "required" on its config'
+            )
+        return cfg.dataset
+
+    def _require_dataset(self, data: DatasetContext) -> LeRobotDataset:
+        """The dataset a recording strategy writes to (built from :meth:`_require_dataset_cfg`)."""
+        if data.dataset is None:
+            raise RuntimeError(
+                f"{type(self).__name__}: no dataset in the rollout context; a recording strategy "
+                'must declare dataset_mode = "required" on its config'
+            )
+        return data.dataset
+
+    def _require_teleop(self, hw: HardwareContext) -> Teleoperator:
+        """The connected teleoperator; ``RolloutConfig`` enforces it via ``requires_teleop``."""
+        if hw.teleop is None:
+            raise RuntimeError(
+                f"{type(self).__name__}: no teleoperator in the rollout context; a strategy that "
+                "reads the teleop must declare requires_teleop = True on its config"
+            )
+        return hw.teleop
+
     def reset_control_state(self) -> None:
         """Clear episode-scoped control state so a paused session can restart cleanly.
 
@@ -110,132 +157,46 @@ class RolloutStrategy(abc.ABC):
             self._interpolator.reset()
         self._cached_obs_processed = None
 
-    # ------------------------------------------------------------------
-    # View ablation
-    # ------------------------------------------------------------------
-
-    def _attach_view_mask(self, ctx: RolloutContext) -> None:
-        """Bind the session's View Mask runtime and register the strategy-owned flush.
-
-        The engine owns the policy/queue half of the Inference Flush; the action
-        interpolator belongs to the strategy, so the strategy registers that half
-        here.  A no-op when ``--view_mask.enabled=false``.
-        """
-        runtime = getattr(ctx.policy, "view_mask", None)
-        if runtime is None:
-            return
-        self._view_mask = runtime
-        runtime.controller.set_sink(self._engine)
-        runtime.add_flush_hook(self._flush_view_mask_actions)
-
-    def _flush_view_mask_actions(self, transition) -> None:
-        """Discard interpolated steps that were derived from the previous mask.
-
-        The robot keeps holding the runtime's ``hold_action`` — the last action it
-        actually received — until a fresh one lands, rather than coasting along a
-        trajectory planned for a scene that no longer applies.
-        """
-        if self._interpolator is None:
-            return
-        runtime = getattr(self._engine, "view_mask", None)
-        if runtime is not None:
-            runtime.hold_action = self._interpolator.last_sent()
-        self._interpolator.flush()
-        # The cached processed observation belongs to the old mask's tick; drop it so
-        # the next policy tick re-processes the observation under the new mask.
+    def hold_control_state(self, hw: HardwareContext) -> None:
+        """Apply a segment-end hold on the control thread after background dispatch is revoked."""
+        if self._interpolator is not None:
+            self._interpolator.reset()
         self._cached_obs_processed = None
+        if hw.robot_wrapper.supports_hold and hw.robot_wrapper.hardware_failure is None:
+            hw.robot_wrapper.hold()
+            self._require_engine().acknowledge_hold()
 
-    def _view_mask_tick(
-        self,
-        ctx: RolloutContext,
-        *,
-        runnable: bool,
-        phase: str | None = None,
-    ) -> bool:
-        """One View Mask tick: charge the timeout, commit pending changes.
+    @contextlib.contextmanager
+    def _pause_for_recording(
+        self, ctx: RolloutContext, *, resume_allowed: Callable[[], bool] | None = None
+    ) -> Iterator[None]:
+        """Invalidate async motion across a blocking mid-run save; resume from a fresh capture.
 
-        Returns ``True`` when the caller must not trust the policy this tick — either
-        because a transition just committed (``APPLYING``, holding the last action) or
-        because the mask is latched ``FAILED`` (which the caller must surface).  A
-        no-op returning ``False`` when view ablation is disabled.
+        Call only inside an active run. Strategies with operator-controlled phases
+        supply their current permission to resume. Save/hold failures propagate and
+        leave inference paused; shutdown, takeover and faults never trigger resumption.
         """
-        runtime = self._view_mask
-        if runtime is None:
-            return False
-        if self._engine is not None and self._engine.failed and not runtime.failed:
-            # An inference failure while a transition is pending means no fresh action
-            # is ever coming: latch FAILED rather than waiting out the whole timeout.
-            runtime.mark_failed("policy inference failed while a view mask transition was pending")
-        transition = runtime.poll(runnable=runnable, phase=phase)
-        if transition is None:
-            return runtime.blocked
-        self._record_view_mask_transition(runtime, transition)
-        return True
-
-    def _view_mask_frame_fields(self, *, human: bool) -> dict | None:
-        """Dataset mask fields for a frame about to be recorded, or ``None`` to skip it.
-
-        A Policy frame is labelled from the *dispatched action's* provenance, never
-        from the controller's live value: under RTC the action being recorded was
-        generated up to a chunk ago, and the mask may already have moved on.  A Human
-        frame has no action of its own, so it carries the live snapshot — the mask on
-        the observation the shadow policy was conditioned on.
-
-        Returns ``None`` during APPLYING/FAILED: those ticks only hold the last
-        action, and recording them would teach the policy that a held action was the
-        right response to the current observation.
-        """
-        runtime = self._view_mask
-        if runtime is None:
-            return None
-        if runtime.blocked:
-            return None
-        snapshot = runtime.current if human else runtime.dispatched
-        return runtime.frame_fields(snapshot)
-
-    def _human_view_mask_fields(self) -> dict | None:
-        """Mask fields for a Human frame, or ``None`` when view ablation is off.
-
-        Human control may continue while the policy is blocked, but blocked ticks
-        are not training samples.  The mask state is still available to telemetry
-        and the sidecar; it is only omitted from the dataset frame.
-        """
-        runtime = self._view_mask
-        if runtime is None or runtime.blocked:
-            return None
-        return runtime.frame_fields(runtime.current)
-
-    def _view_mask_failed_should_stop(self, _ctx: RolloutContext) -> bool:
-        """Whether the current segment should end after View Mask FAILED.
-
-        Ending the segment in both modes lets the controller surface one failure event
-        and return to its idle command loop.  Interactive recovery still works through
-        ``/reset``; it no longer requires a failed strategy loop to spin forever.
-        """
-        return self._view_mask is not None and self._view_mask.failed
-
-    def _note_recorded_frame(self, dataset) -> None:
-        """Keep the sidecar's alignment hint pointing at the last frame actually recorded."""
-        if self._view_mask is None:
+        engine = self._require_engine()
+        if engine.control_thread_owns_policy:
+            yield
             return
-        self._view_mask.note_frame(
-            episode_index=getattr(dataset, "num_episodes", None),
-            frame_index=getattr(dataset, "num_frames", None),
-        )
+        was_autonomous = resume_allowed is None or resume_allowed()
+        engine.pause()
+        self.hold_control_state(ctx.hardware)
+        logger.info("Inference paused for episode save; buffered motion invalidated")
+        yield
+        if (
+            was_autonomous
+            and not ctx.runtime.shutdown_event.is_set()
+            and not engine.failed
+            and (resume_allowed is None or resume_allowed())
+        ):
+            engine.resume()
+            logger.info("Episode save complete; inference resumes from the next fresh observation")
 
-    def _record_view_mask_transition(self, runtime, transition) -> None:
-        """Alignment hint: where the event landed relative to the dataset timeline.
-
-        The counters read here are the ones from the last recorded frame, because the
-        transition has no frame of its own — it happened *between* frames, and the
-        sidecar's job is to say exactly that rather than to invent a timestamp.
-        """
-        dataset = self._view_mask_dataset
-        if dataset is None:
-            return
-        self._note_recorded_frame(dataset)
-
-    def _process_observation_and_notify(self, processors: ProcessorContext, obs_raw: dict) -> dict:
+    def _process_observation_and_notify(
+        self, processors: ProcessorContext, obs_raw: RobotObservation
+    ) -> RobotObservation:
         """Run the observation processor and notify the engine — throttled to policy ticks.
 
         Callers are responsible for calling ``robot.get_observation()`` every loop
@@ -252,9 +213,9 @@ class RolloutStrategy(abc.ABC):
         called (warmup completion, DAgger phase transitions back to AUTONOMOUS),
         because reset makes ``needs_new_action()`` return True on the next call.
         """
-        if self._cached_obs_processed is None or self._interpolator.needs_new_action():
+        if self._cached_obs_processed is None or self._require_interpolator().needs_new_action():
             obs_processed = processors.robot_observation_processor(obs_raw)
-            self._engine.notify_observation(obs_processed)
+            self._require_engine().notify_observation(obs_processed)
             self._cached_obs_processed = obs_processed
         return self._cached_obs_processed
 
@@ -266,9 +227,16 @@ class RolloutStrategy(abc.ABC):
         stays anchored.  On the first post-warmup iteration the engine and
         interpolator are reset so stale warmup state is discarded.
         """
-        engine = self._engine
-        interpolator = self._interpolator
         if not use_torch_compile:
+            return False
+        engine = self._require_engine()
+        interpolator = self._require_interpolator()
+        # A compiled model can hang inside its first call. Warmup bypasses the
+        # normal dispatch path, so explicitly run the nonblocking deadline gate.
+        engine.dispatch_allowed()
+        if engine.failed:
+            # Let send_next_action apply the robot hold and acknowledge it; do
+            # not keep waiting, reset model state, or resume a faulted engine.
             return False
         if not engine.ready:
             timer.wait()
@@ -283,25 +251,58 @@ class RolloutStrategy(abc.ABC):
         return False
 
     def _teardown_hardware(self, hw: HardwareContext, return_to_initial_position: bool = True) -> None:
-        """Stop the inference engine, optionally return robot to initial position, and disconnect hardware."""
-        if self._engine is not None:
-            logger.info("Stopping inference engine...")
-            self._engine.stop()
-        robot = hw.robot_wrapper.inner
-        if robot.is_connected:
-            if return_to_initial_position and hw.initial_position:
-                logger.info("Returning robot to initial position before shutdown...")
-                self.return_to_initial_position(hw)
-            elif not return_to_initial_position:
-                logger.info(
-                    "Skipping return-to-initial-position (disabled by config); leaving robot in final pose."
-                )
-            logger.info("Disconnecting robot...")
-            robot.disconnect()
-        teleop = hw.teleop
-        if teleop is not None and teleop.is_connected:
-            logger.info("Disconnecting teleoperator...")
-            teleop.disconnect()
+        """End policy execution, perform configured local shutdown movement, and disconnect.
+
+        A terminal inference fault does not imply failed local hardware. Honor
+        the return setting in that case; never home after a failed command.
+        Homing uses ordinary observation acquisition and can fail with it.
+        Disconnect torque behavior belongs to the robot driver, not the hold.
+        """
+        wrapper = hw.robot_wrapper
+        if self._interpolator is not None:
+            self._interpolator.reset()
+        self._cached_obs_processed = None
+        try:
+            if self._engine is not None:
+                logger.info("Stopping inference engine...")
+                if self._engine.failed and wrapper.supports_hold and wrapper.hardware_failure is None:
+                    try:
+                        wrapper.hold()
+                    except Exception:
+                        logger.exception("Fault hold failed; skipping further shutdown movement")
+                self._engine.stop()
+        finally:
+            robot = wrapper.inner
+            try:
+                if robot.is_connected:
+                    try:
+                        if wrapper.hardware_failure is not None:
+                            logger.warning(
+                                "Skipping return-to-initial-position: robot I/O failed: %s",
+                                wrapper.hardware_failure,
+                            )
+                        elif not return_to_initial_position:
+                            logger.info("Skipping return-to-initial-position: disabled by config")
+                        elif not hw.initial_position:
+                            logger.info("Skipping return-to-initial-position: no initial position captured")
+                        else:
+                            logger.info("Returning robot to initial position before shutdown...")
+                            self.return_to_initial_position(hw)
+                    finally:
+                        torque_setting = getattr(
+                            getattr(robot, "config", None), "disable_torque_on_disconnect", "unspecified"
+                        )
+                        logger.info(
+                            "Disconnecting robot: disable_torque_on_disconnect=%s; "
+                            "a prior hold command does not guarantee pose retention after disconnect",
+                            torque_setting,
+                        )
+                        robot.disconnect()
+            finally:
+                teleop = hw.teleop
+                if teleop is not None and teleop.is_connected:
+                    logger.info("Disconnecting teleoperator...")
+                    teleop.disconnect()
 
     @staticmethod
     def return_to_initial_position(hw: HardwareContext, duration_s: float = 3.0, fps: int = 50) -> bool:
@@ -312,10 +313,20 @@ class RolloutStrategy(abc.ABC):
         a completed reset on ``False``.
         """
         robot = hw.robot_wrapper
+        if robot.hardware_failure is not None:
+            logger.warning(
+                "Cannot return to initial position after robot I/O failure: %s", robot.hardware_failure
+            )
+            return False
         target = hw.initial_position
+        if target is None:
+            logger.warning("Could not return to initial position: none was captured at connect time")
+            return False
         try:
             current_obs = robot.get_observation()
-            current_pos = {k: v for k, v in current_obs.items() if k in target}
+            current_pos = {k: float(current_obs[k]) for k in target}
+            if not all(math.isfinite(current_pos[k]) and math.isfinite(target[k]) for k in target):
+                raise ValueError("Return movement requires finite current and initial positions")
             steps = max(int(duration_s * fps), 1)
             for step in range(1, steps + 1):
                 t = step / steps
@@ -346,35 +357,13 @@ class RolloutStrategy(abc.ABC):
             compress_images=cfg.display_compressed_images,
         )
 
-    def _log_view_mask(self, runtime_ctx: RuntimeContext) -> None:
-        """Publish the View Mask status to the display backend, when one is active.
-
-        Deliberately gated on ``display_data``: the display is a monitor, never a
-        control surface, so turning it off must leave ablation fully functional.  The
-        terminal log remains the authoritative record either way.
-        """
-        runtime = self._view_mask
-        if runtime is None or not runtime_ctx.cfg.display_data:
-            return
-        try:
-            log_view_mask_status(
-                runtime_ctx.cfg.display_mode,
-                observation=self._cached_obs_processed,
-                **runtime.telemetry(),
-            )
-        except Exception:  # a display failure must never take the control loop down
-            logger.exception("Failed to publish view mask status to the display backend")
-
     def setup(self, ctx: RolloutContext) -> None:
-        """Initialise the inference engine and attach View Ablation.
+        """Strategy-specific initialisation (keyboard listeners, buffers, etc.).
 
-        The default only attaches and starts the inference engine and wires View
-        Ablation; an override must call ``super().setup(ctx)`` first, then keep its
-        own extra initialisation.  ``_attach_view_mask`` is NOT idempotent, so it
-        must only run here: never call it again from an override.
+        The default only attaches and starts the inference engine; an override must
+        call ``self._init_engine(ctx)`` (or ``super().setup(ctx)``) first.
         """
         self._init_engine(ctx)
-        self._attach_view_mask(ctx)
 
     @abc.abstractmethod
     def run(self, ctx: RolloutContext) -> None:
@@ -385,6 +374,10 @@ class RolloutStrategy(abc.ABC):
         the end of every segment), and ``engine.pump_query(obs_processed)`` at the end
         of every tick — the text-query channel only advances through it, and a
         multi-second generation must not sit inside the action path.
+
+        Publish each captured observation with ``engine.notify_observation``
+        and dispatch through :func:`send_next_action` on every autonomous motor
+        tick, even when no new action is expected.
 
         Each ``run()`` call builds its own ``CycleTimer`` and reports it through
         ``timer.log_run_summary()`` from its ``finally``: a fresh timer's start-up
@@ -492,76 +485,49 @@ def send_next_action(
     ``robot_action_processor`` to the robot.  Works identically for
     sync and async backends — the rollout strategy never needs to branch.
 
+    Call once per autonomous motor tick, including interpolation and held ticks.
+    This is the strategy's dispatch boundary: it checks permission before
+    pulling and sending, clears interpolation on a
+    denial, performs a supported local hold, acknowledges it, and notifies the
+    engine after dispatch. A direct ``get_action`` call does not replace it.
+
     When *timer* is given, the engine pull and the robot send are timed as the
     ``infer`` and ``send`` steps of its cadence summary, and a tick with no action
     to send is counted there.  Note that on async backends ``infer`` is only a
     queue pull — inference runs off-thread, so its latency surfaces as starved
     ticks rather than as loop-body time.
 
-    Returns the action dict that was sent, or ``None`` if no action was
-    ready (e.g. empty async queue, interpolator not yet primed).
+    Returns the canonical action dict for a dispatched policy action, or ``None``
+    while waiting or faulted. A supported hold command may still have been sent.
     """
     engine = ctx.policy.inference
-    features = ctx.data.dataset_features
+    wrapper = ctx.hardware.robot_wrapper
     ordered_keys = ctx.data.ordered_action_keys
     # ``nullcontext`` accepts (and ignores) the section name, so it stands in for
     # ``timer.section`` verbatim when no timer was passed.
     section = timer.section if timer is not None else contextlib.nullcontext
 
-    if interpolator.needs_new_action():
-        with section("infer"):
-            obs_frame = build_dataset_frame(features, obs_processed, prefix=OBS_STR)
-            action_tensor = engine.get_action(obs_frame)
-        if action_tensor is not None:
-            interpolator.add(action_tensor.cpu())
+    def hold() -> None:
+        if wrapper.supports_hold:
+            wrapper.hold()
 
-    interp = interpolator.get()
+    # The gate/hold/acknowledge order is shared with other control loops through
+    # ``lerobot.inference``; this helper adds the frame, processor and cadence stats.
+    interp = next_interpolated_action(
+        engine,
+        interpolator,
+        lambda: build_dataset_frame(ctx.data.dataset_features, obs_processed, prefix=OBS_STR),
+        hold=hold,
+        timer=timer,
+    )
     if interp is None:
-        if timer is not None:
-            timer.note_starved_tick()
-        # A View Mask transition cleared the interpolated tail: hold the last action
-        # the robot actually received until a fresh one is available.
-        return hold_last_action(ctx, obs_raw, section)
+        return None
 
     if len(interp) != len(ordered_keys):
         raise ValueError(f"Interpolated tensor length ({len(interp)}) != action keys ({len(ordered_keys)})")
     action_dict = {k: interp[i].item() for i, k in enumerate(ordered_keys)}
     with section("send"):
         processed = ctx.processors.robot_action_processor((action_dict, obs_raw))
-        ctx.hardware.robot_wrapper.send_action(processed)
-    return action_dict
-
-
-def hold_last_action(ctx: RolloutContext, obs_raw: dict, section) -> dict | None:
-    """Send a safe hold command while a mask transition has no fresh action.
-
-    Only View Ablation uses this: without a transition the engine being starved is an
-    ordinary condition that the strategies treat as "send nothing".  With one, the
-    alternative to holding is leaving the robot uncommanded for the whole APPLYING
-    window.  Position actions can be repeated safely; velocity and delta actions
-    must be zeroed instead of replaying a stale command.  Unknown action semantics
-    are left untouched (no command is sent) rather than guessed.
-
-    Returns ``None`` — meaning "send nothing" — whenever view ablation is off or the
-    mask is not blocking, so this is a no-op for every ordinary rollout.
-    """
-    runtime = getattr(ctx.policy, "view_mask", None)
-    if runtime is None or not runtime.blocked or runtime.hold_action is None:
-        return None
-    hold = runtime.hold_action
-    action_dict = {}
-    for i, key in enumerate(ctx.data.ordered_action_keys):
-        if key.endswith((".vel", ".velocity", ".delta")):
-            action_dict[key] = 0.0
-        elif key.endswith((".pos", ".position")):
-            action_dict[key] = hold[i].item()
-        else:
-            logger.warning(
-                "Cannot safely hold action key %r during View Mask transition; skipping hold command",
-                key,
-            )
+        if not commit_action(engine, interpolator, lambda: wrapper.send_action(processed), hold=hold):
             return None
-    with section("send"):
-        processed = ctx.processors.robot_action_processor((action_dict, obs_raw))
-        ctx.hardware.robot_wrapper.send_action(processed)
     return action_dict

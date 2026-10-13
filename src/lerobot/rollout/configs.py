@@ -25,13 +25,10 @@ import draccus
 
 from lerobot.configs import PreTrainedConfig, parser
 from lerobot.configs.dataset import DatasetRecordConfig
+from lerobot.inference import InferenceEngineConfig, RemoteInferenceConfig, SyncInferenceConfig
 from lerobot.robots.config import RobotConfig
 from lerobot.teleoperators.config import TeleoperatorConfig
 from lerobot.utils.device_utils import auto_select_torch_device, is_torch_device_available
-
-from .inference import InferenceEngineConfig, SyncInferenceConfig
-from .saliency.config import SaliencyConfig, validate_saliency
-from .view_mask.config import ViewMaskConfig, validate_view_mask
 
 logger = logging.getLogger(__name__)
 
@@ -290,7 +287,7 @@ class RolloutConfig:
     # or any name registered by a third-party package)
     strategy: RolloutStrategyConfig = field(default_factory=BaseStrategyConfig)
 
-    # Inference backend (polymorphic: --inference.type=sync|rtc)
+    # Inference backend (polymorphic: --inference.type=sync|rtc|remote)
     inference: InferenceEngineConfig = field(default_factory=SyncInferenceConfig)
 
     # Dataset (required, optional or rejected according to the strategy's ``dataset_mode``)
@@ -327,11 +324,6 @@ class RolloutConfig:
     display_port: int | None = None
     # Whether to display compressed (JPEG) images instead of raw frames
     display_compressed_images: bool = False
-    # Saliency overlay videos (--saliency.*). See rollout/saliency/config.py.
-    saliency: SaliencyConfig = field(default_factory=SaliencyConfig)
-    # View ablation (--view_mask.*): opt-in blacking-out of selected policy views.
-    # See rollout/view_mask/config.py. Disabled by default and inert when disabled.
-    view_mask: ViewMaskConfig = field(default_factory=ViewMaskConfig)
     # Use vocal synthesis to read events
     play_sounds: bool = True
     resume: bool = False
@@ -388,15 +380,6 @@ class RolloutConfig:
         if self.autosteer_interval_s < 0:
             raise ValueError(f"--autosteer_interval_s must be >= 0 (got {self.autosteer_interval_s}).")
 
-        validate_saliency(
-            self.saliency, self.inference, self.display_mode, self.display_data, self.use_torch_compile
-        )
-
-        # View ablation: reject a half-configured group before any hardware or policy
-        # I/O. Name resolution and hotkey arbitration need the loaded policy/robot and
-        # happen in build_rollout_context instead.
-        validate_view_mask(self.view_mask)
-
         # A strategy that writes frames from inside the timed control loop cannot afford
         # a blocking encode: force streaming encoding on its behalf.
         if (
@@ -412,6 +395,13 @@ class RolloutConfig:
             raise ValueError("--robot.type is required for rollout")
 
         policy_path = parser.get_path_arg("policy")
+        remote = isinstance(self.inference, RemoteInferenceConfig)
+        if remote and (
+            policy_path or self.policy is not None or self.device is not None or self.use_torch_compile
+        ):
+            raise ValueError(
+                "Remote inference owns policy/device configuration; omit --policy, --device and --use_torch_compile"
+            )
         if policy_path:
             yaml_overrides = parser.get_yaml_overrides("policy")
             cli_overrides = parser.get_cli_overrides("policy") or []
@@ -425,7 +415,7 @@ class RolloutConfig:
                 cli_overrides=policy_overrides,
             )
             self.policy.pretrained_path = policy_path
-        if self.policy is None:
+        if self.policy is None and not remote:
             raise ValueError("--policy.path is required for rollout")
 
         # --- Task resolution ---
@@ -443,6 +433,8 @@ class RolloutConfig:
         # Resolve device from the policy config when not explicitly set so all
         # components (policy.to, preprocessor, inference engine) use the same
         # device string instead of inconsistent fallbacks.
+        if remote:
+            return
         if self.device is None or not is_torch_device_available(self.device):
             resolved = self.policy.device
             if resolved:

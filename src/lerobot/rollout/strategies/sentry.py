@@ -22,13 +22,14 @@ import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from threading import Event, Lock
 
+from lerobot.datasets import LeRobotDataset
 from lerobot.datasets.utils import DEFAULT_VIDEO_FILE_SIZE_IN_MB
 from lerobot.utils.constants import ACTION, OBS_STR
 from lerobot.utils.cycle_timer import CycleTimer
 from lerobot.utils.feature_utils import build_dataset_frame
 from lerobot.utils.utils import log_say
 
-from ..configs import SentryStrategyConfig
+from ..configs import RolloutConfig, SentryStrategyConfig
 from ..context import RolloutContext
 from .core import (
     RolloutStrategy,
@@ -53,9 +54,9 @@ class SentryStrategy(RolloutStrategy):
     so no push is ever silently dropped and exactly one push runs at a
     time.
 
-    Policy state (hidden state, RTC queue) intentionally persists across
-    episode boundaries — Sentry slices one continuous rollout, the robot
-    does not reset between slices.
+    Policy hidden state persists across episode boundaries. Async motion is
+    invalidated and held during blocking saves, then resumes from a fresh capture;
+    the robot does not return to its initial position between slices.
 
     Requires ``streaming_encoding=True`` (enforced in config validation)
     to prevent disk I/O from blocking the control loop.
@@ -67,10 +68,10 @@ class SentryStrategy(RolloutStrategy):
 
     config: SentryStrategyConfig
 
-    def __init__(self, config: SentryStrategyConfig):
+    def __init__(self, config: SentryStrategyConfig) -> None:
         super().__init__(config)
         self._push_executor: ThreadPoolExecutor | None = None
-        self._pending_push: Future | None = None
+        self._pending_push: Future[None] | None = None
         self._needs_push = Event()
         self._episode_lock = Lock()
         # Instance state, not run()-local, so the upload cadence survives segments.
@@ -82,8 +83,7 @@ class SentryStrategy(RolloutStrategy):
 
     def setup(self, ctx: RolloutContext) -> None:
         """Initialise the inference engine and background push executor."""
-        super().setup(ctx)
-        self._view_mask_dataset = ctx.data.dataset if self._view_mask is not None else None
+        self._init_engine(ctx)
         self._push_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="sentry-push")
         target_mb = self.config.target_video_file_size_mb or DEFAULT_VIDEO_FILE_SIZE_IN_MB
         self._episode_duration_s = estimate_max_episode_seconds(
@@ -102,11 +102,11 @@ class SentryStrategy(RolloutStrategy):
                 "Refusing to start a new segment: a previous save_episode failed mid-write, so "
                 "the dataset on disk may be partially committed. Inspect it before recording more."
             )
-        engine = self._engine
+        engine = self._require_engine()
+        interpolator = self._require_interpolator()
         cfg = ctx.runtime.cfg
         robot = ctx.hardware.robot_wrapper
-        dataset = ctx.data.dataset
-        interpolator = self._interpolator
+        dataset = self._require_dataset(ctx.data)
         features = ctx.data.dataset_features
 
         # Per-segment timer, never hoisted onto the instance (see ``RolloutStrategy.run``).
@@ -135,48 +135,28 @@ class SentryStrategy(RolloutStrategy):
                 if self._handle_warmup(cfg.use_torch_compile, timer):
                     continue
 
-                applying = self._view_mask_tick(ctx, runnable=True)
-                if applying:
-                    with timer.section("telemetry"):
-                        self._log_view_mask(ctx.runtime)
-                    if self._view_mask_failed_should_stop(ctx):
-                        logger.error("View mask failed; ending rollout segment")
-                        break
-                    action_dict = send_next_action(obs_processed, obs, ctx, interpolator, timer)
-                    if action_dict is None:
-                        with timer.section("query"):
-                            engine.pump_query(obs_processed)
-                        timer.wait()
-                        continue
-                else:
-                    action_dict = send_next_action(obs_processed, obs, ctx, interpolator, timer)
+                action_dict = send_next_action(obs_processed, obs, ctx, interpolator, timer)
 
                 if action_dict is not None:
                     with timer.section("telemetry"):
                         self._log_telemetry(obs_processed, action_dict, ctx.runtime)
-                        self._log_view_mask(ctx.runtime)
                     # Record once per interpolation cycle so the dataset cadence
                     # matches its declared fps; interpolated ticks only send
                     # commands to the robot.
                     if interpolator.emitted_policy_action:
-                        mask_fields = self._view_mask_frame_fields(human=False)
-                        if mask_fields is not None or self._view_mask is None:
-                            with timer.section("record"):
-                                obs_frame = build_dataset_frame(features, obs_processed, prefix=OBS_STR)
-                                action_frame = build_dataset_frame(features, action_dict, prefix=ACTION)
-                                # Label with ``dispatched_task``, the instruction that generated the action just
-                                # sent (the live ``engine.task`` would mislabel actions still queued from the
-                                # previous one); sound at any multiplier, since no ``get_action`` has run since
-                                # the refill tick that produced this action.
-                                frame = {**obs_frame, **action_frame, "task": engine.dispatched_task}
-                                if mask_fields is not None:
-                                    frame.update(mask_fields)
-                                # ``add_frame`` writes to the in-progress episode buffer; the
-                                # background pusher only ever touches *finalised* episode
-                                # artifacts on disk.  The two operate on disjoint state, so
-                                # ``add_frame`` does not need ``_episode_lock``.
-                                dataset.add_frame(frame)
-                                self._note_recorded_frame(dataset)
+                        with timer.section("record"):
+                            obs_frame = build_dataset_frame(features, obs_processed, prefix=OBS_STR)
+                            action_frame = build_dataset_frame(features, action_dict, prefix=ACTION)
+                            # Label with ``dispatched_task``, the instruction that generated the action just
+                            # sent (the live ``engine.task`` would mislabel actions still queued from the
+                            # previous one); sound at any multiplier, since no ``get_action`` has run since
+                            # the refill tick that produced this action.
+                            frame = {**obs_frame, **action_frame, "task": engine.dispatched_task}
+                            # ``add_frame`` writes to the in-progress episode buffer; the
+                            # background pusher only ever touches *finalised* episode
+                            # artifacts on disk.  The two operate on disjoint state, so
+                            # ``add_frame`` does not need ``_episode_lock``.
+                            dataset.add_frame(frame)
 
                 # Episode rotation derived from video file-size target.
                 # The duration is a conservative estimate so the actual
@@ -184,7 +164,8 @@ class SentryStrategy(RolloutStrategy):
                 # keeping push_to_hub efficient (uploads complete files).
                 elapsed = time.perf_counter() - episode_start
                 if elapsed >= episode_duration_s:
-                    self._checked_save_episode(dataset)
+                    with self._pause_for_recording(ctx):
+                        self._checked_save_episode(dataset)
                     logger.info(
                         "Episode saved (total: %d, elapsed: %.1fs)",
                         dataset.num_episodes,
@@ -215,7 +196,7 @@ class SentryStrategy(RolloutStrategy):
             timer.log_run_summary()
             self._save_tail_episode(dataset, cfg)
 
-    def _checked_save_episode(self, dataset) -> None:
+    def _checked_save_episode(self, dataset: LeRobotDataset) -> None:
         """``save_episode`` under the push lock; a failure poisons the dataset and re-raises.
 
         A failed ``save_episode`` is *not* recoverable by discarding the buffer:
@@ -233,7 +214,7 @@ class SentryStrategy(RolloutStrategy):
                 dataset.clear_episode_buffer(delete_images=False)
             raise
 
-    def _save_tail_episode(self, dataset, cfg) -> None:
+    def _save_tail_episode(self, dataset: LeRobotDataset, cfg: RolloutConfig) -> None:
         """Commit the segment's partial tail episode; fail loudly on real errors.
 
         Runs in ``run()``'s ``finally``.  Returns early on an already-poisoned
@@ -249,7 +230,7 @@ class SentryStrategy(RolloutStrategy):
         self._checked_save_episode(dataset)
         self._register_saved_episode(dataset, cfg)
 
-    def _register_saved_episode(self, dataset, cfg) -> None:
+    def _register_saved_episode(self, dataset: LeRobotDataset, cfg: RolloutConfig) -> None:
         """Post-save bookkeeping, shared by the rotation and tail-save sites.
 
         Tail episodes must count toward ``upload_every_n_episodes`` too, or a session
@@ -315,7 +296,7 @@ class SentryStrategy(RolloutStrategy):
         )
         logger.info("Sentry strategy teardown complete")
 
-    def _background_push(self, dataset, cfg) -> None:
+    def _background_push(self, dataset: LeRobotDataset, cfg: RolloutConfig) -> None:
         """Queue a Hub push on the single-worker executor.
 
         The executor's max_workers=1 guarantees at most one push runs at
@@ -330,7 +311,7 @@ class SentryStrategy(RolloutStrategy):
         if self._pending_push is not None and not self._pending_push.done():
             logger.info("Previous push still in progress; queueing next")
 
-        def _push():
+        def _push() -> None:
             try:
                 with self._episode_lock:
                     if self._dataset_poisoned:

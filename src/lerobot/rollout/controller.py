@@ -30,7 +30,7 @@ from enum import Enum
 from threading import Event, Lock
 from typing import TYPE_CHECKING
 
-from .inference import QueryAnswer, QueryKind
+from lerobot.inference import QueryAnswer
 
 if TYPE_CHECKING:
     from .context import RolloutContext
@@ -80,14 +80,10 @@ class AskResult(Enum):
     """Rejected: another question or autosteer turn holds the single-slot channel."""
 
     UNSUPPORTED = "unsupported"
-    """Rejected: the policy has no text head; unlike the others, permanent for the session."""
+    """Rejected: text queries are unavailable for this policy/robot setup."""
 
-    MASK_APPLYING = "mask_applying"
-    """Rejected: a View Mask transition is in flight, so any answer would describe the
-    previous mask. Retry once the new revision is ACTIVE."""
-
-    MASK_FAILED = "mask_failed"
-    """Rejected: the View Mask latched FAILED. Only an explicit ``/reset`` recovers."""
+    INVALID = "invalid"
+    """Rejected: invalid text; :meth:`RolloutController.text_input_error` explains how to fix it."""
 
 
 class RolloutEvent(Enum):
@@ -118,7 +114,7 @@ class RolloutEvent(Enum):
 
     QUERY_ANSWERED = "query_answered"
     """A text query resolved (an :meth:`RolloutController.ask` question or an autosteer turn); the
-    payload is a :class:`~lerobot.rollout.inference.QueryAnswer`, check ``ok`` before ``answer``."""
+    payload is a :class:`~lerobot.inference.QueryAnswer`, check ``ok`` before ``answer``."""
 
     ENGINE_FAILED = "engine_failed"
     """The engine hit an unrecoverable error; ``serve()`` is returning.  Read
@@ -126,11 +122,6 @@ class RolloutEvent(Enum):
 
     STRATEGY_FAILED = "strategy_failed"
     """``strategy.run()`` raised mid-segment (robot I/O, recording, ...); ``serve()`` is returning."""
-
-    VIEW_MASK_FAILED = "view_mask_failed"
-    """The View Mask latched FAILED: no fresh action arrived for the newest revision.
-    The current segment ends and an interactive controller returns to its idle command
-    loop so the operator can ``/reset``; a non-interactive rollout ends."""
 
     STOPPED = "stopped"
     """``serve()`` is returning (stop, front-end EOF, a failure, or a parent shutdown signal)."""
@@ -181,7 +172,6 @@ class RolloutController:
         self._on_event = on_event
         self._initial_task = ctx.policy.inference.task
         self._autosteer_interval_s = ctx.runtime.cfg.autosteer_interval_s
-        self._view_runtime = getattr(ctx.policy, "view_mask", None)
 
         # Serializes the control methods so multi-writer task updates keep their call order.
         self._control_lock = Lock()
@@ -195,7 +185,6 @@ class RolloutController:
         # Latched (never cleared) when serve() exits; the control methods then refuse.
         self._stopped = Event()
         self._strategy_failure_traceback: str | None = None
-        self._view_mask_failure_reported_revision: int | None = None
 
         # Answers only leave the engine through pump_query(), called on the serve thread, so this
         # observer keeps the "events fire on the serve thread" guarantee.
@@ -260,10 +249,6 @@ class RolloutController:
         Hardware and policy stay warm; call :meth:`start` to run again.  Returns ``True`` when the
         task was restored (i.e. it had been changed), ``False`` when it was already the launch task
         or the controller is stopping or stopped.
-
-        With view ablation enabled this is also the documented recovery from a FAILED mask: the
-        launch mask is restored at a *new* revision (never back to 0, so results from the old
-        revision stay recognisably stale).
         """
         with self._control_lock:
             if self._stopped.is_set() or self._stop_requested.is_set():
@@ -273,8 +258,10 @@ class RolloutController:
             self._start_requested.clear()
             # Back to square one, so the sequencer stops too: it would overwrite the restored task.
             self._ctx.policy.inference.stop_autosteer()
+            # Restore here, not later on the serve thread, so a following set_task() survives.
             restored = self._ctx.policy.inference.set_task(self._initial_task)
             self._reset_requested.set()
+            self._ctx.policy.inference.pause()
             self._segment_stop.set()
             self._wake.set()
             return restored
@@ -286,6 +273,7 @@ class RolloutController:
                 return
             self._start_requested.clear()  # last command wins, see reset()
             self._stop_requested.set()
+            self._ctx.policy.inference.pause()
             self._segment_stop.set()
             self._wake.set()
 
@@ -298,25 +286,33 @@ class RolloutController:
         controller is stopping or stopped.  Stops :meth:`autosteer`, which would overwrite this instruction.
         """
         with self._control_lock:
-            if self._stopped.is_set() or self._stop_requested.is_set():
+            if (
+                self._stopped.is_set()
+                or self._stop_requested.is_set()
+                or self.text_input_error(task, instruction=True) is not None
+            ):
                 return False
             self._ctx.policy.inference.stop_autosteer()
             return self._ctx.policy.inference.set_task(task)
+
+    def text_input_error(self, text: str, *, instruction: bool = False) -> str | None:
+        """Return the active engine's text rejection reason without changing its state."""
+        return self._ctx.policy.inference.text_input_error(text, instruction=instruction)
 
     def ask(self, question: str) -> AskResult:
         """Queue a question about what the robot currently sees.
 
         Returns immediately; the answer arrives as a :attr:`RolloutEvent.QUERY_ANSWERED` event, and
         the policy is never touched on the caller's thread.  Rejected with
-        :attr:`AskResult.UNSUPPORTED` (no text head), :attr:`AskResult.NOT_RUNNING` (no segment
-        running, so no observation to answer from), or :attr:`AskResult.BUSY` (channel taken).
+        :attr:`AskResult.UNSUPPORTED` (capability unavailable), :attr:`AskResult.NOT_RUNNING` (no segment
+        running, so no observation to answer from), :attr:`AskResult.INVALID` (text fails
+        validation), or :attr:`AskResult.BUSY` (channel taken).
         """
         # A static capability: checked first, and outside the control lock.
         if not self._ctx.policy.inference.supports_text_queries:
             return AskResult.UNSUPPORTED
-        masked = self.view_mask_blocked()
-        if masked is not None:
-            return masked
+        if self.text_input_error(question) is not None:
+            return AskResult.INVALID
         with self._control_lock:
             # Same lock _run_segment clears _running under, so a question is never left orphaned.
             if not self._running.is_set():
@@ -324,25 +320,6 @@ class RolloutController:
             if not self._ctx.policy.inference.ask(question):
                 return AskResult.BUSY
             return AskResult.QUEUED
-
-    def view_mask_blocked(self) -> AskResult | None:
-        """``None`` when text queries are allowed, else the rejection to return.
-
-        View ablation forbids asking the policy about a scene while its mask is
-        APPLYING (the answer would describe the previous mask, which the operator has
-        already abandoned) or FAILED (nothing is allowed to run against that mask).
-        """
-        runtime = self._view_runtime
-        if runtime is None or not runtime.blocked:
-            return None
-        if runtime.failed:
-            return AskResult.MASK_FAILED
-        return AskResult.MASK_APPLYING
-
-    @property
-    def view_mask(self):
-        """The View Mask runtime, or ``None`` when view ablation is disabled."""
-        return self._view_runtime
 
     @property
     def autosteer_goal(self) -> str | None:
@@ -359,9 +336,8 @@ class RolloutController:
         """
         if not self._ctx.policy.inference.supports_text_queries:
             return AskResult.UNSUPPORTED
-        masked = self.view_mask_blocked()
-        if masked is not None:
-            return masked
+        if self.text_input_error(goal) is not None:
+            return AskResult.INVALID
         with self._control_lock:
             if not self._running.is_set():
                 return AskResult.NOT_RUNNING
@@ -394,17 +370,6 @@ class RolloutController:
                 if self._ctx.policy.inference.failed:
                     self._emit(RolloutEvent.ENGINE_FAILED)
                     break
-                if self._view_runtime is not None and self._view_runtime.failed:
-                    # Report the edge once, then leave interactive sessions in the
-                    # idle command loop so /reset remains available.
-                    revision = self._view_runtime.revision
-                    if self._view_mask_failure_reported_revision != revision:
-                        self._view_mask_failure_reported_revision = revision
-                        self._emit(RolloutEvent.VIEW_MASK_FAILED)
-                    if not self._ctx.runtime.cfg.interactive:
-                        break
-                elif self._view_runtime is not None:
-                    self._view_mask_failure_reported_revision = None
                 if self._strategy_failure_traceback is not None:
                     self._emit(RolloutEvent.STRATEGY_FAILED)
                     break
@@ -465,6 +430,14 @@ class RolloutController:
                 logger.exception("Rollout strategy failed mid-segment")
             finally:
                 engine.pause()
+                try:
+                    self._strategy.hold_control_state(self._ctx.hardware)
+                except Exception:
+                    # A failed final hold must end the session, but must not hide
+                    # the original strategy/I/O failure that prompted teardown.
+                    if self._strategy_failure_traceback is None:
+                        self._strategy_failure_traceback = traceback.format_exc()
+                    logger.exception("Could not apply segment-end hold; skipping further shutdown movement")
         finally:
             # Clear and drop together under the control lock: ask() gates on _running under the same
             # lock, so a question either lands before this and is dropped, or is rejected outright.
@@ -472,37 +445,24 @@ class RolloutController:
                 self._running.clear()
                 # The sequencer cannot outlive the segment: its plan progress lives in the policy.
                 engine.stop_autosteer()
-                dropped = engine.drop_pending_query()
+                engine.drop_pending_query()
                 # Else the idle pump would announce a subtask after the sequencer ended; VQA stays.
                 engine.drop_ready_subtask_answers()
-            # Only an operator question is worth reporting.
-            if dropped is not None and dropped.kind is QueryKind.VQA:
-                self._emit(
-                    RolloutEvent.QUERY_ANSWERED,
-                    QueryAnswer(question=dropped.text, error="the run ended before it could be answered"),
-                )
-        if (
-            engine.failed
-            or self._strategy_failure_traceback is not None
-            or (self._view_runtime is not None and self._view_runtime.failed)
-        ):
-            return  # the serve loop emits the failure event and handles the mode
+                engine.report_cancelled_query()
+            # Deliver before a terminal /stop leaves the serve loop, including a
+            # claimed VQA whose model call has not returned yet.
+            engine.pump_query()
+        if engine.failed or self._strategy_failure_traceback is not None:
+            return  # the serve loop emits the failure event and shuts down
         if not (
             self._stop_requested.is_set() or self._reset_requested.is_set() or self._global_shutdown.is_set()
         ):
             self._emit(RolloutEvent.SEGMENT_ENDED)
 
     def _reset_robot(self) -> None:
-        """Pause inference, restore the mask, and return the robot home.
-
-        A reset may be requested from an interactive/UI thread while the strategy
-        and RTC worker are still active.  Mask restoration therefore belongs on the
-        serve/control thread, next to the engine pause and strategy-owned flushes.
-        """
+        """Pause inference and return the robot home (the task was restored by :meth:`reset`)."""
         self._emit(RolloutEvent.RESET_STARTED)
         self._ctx.policy.inference.pause()
-        if self._view_runtime is not None:
-            self._view_runtime.restore_launch_mask()
         if not self._ctx.hardware.initial_position:
             logger.warning("No initial position captured — skipping the return move")
             self._emit(RolloutEvent.RESET_SKIPPED)
