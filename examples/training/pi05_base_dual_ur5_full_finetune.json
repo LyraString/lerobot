@@ -1,0 +1,57 @@
+{
+  "dataset": {
+    "repo_id": "local/dual-ur5-demo-coloured",
+    "root": "/data0/zhj/datasets/dual_ur5_demo_coloured",
+    "video_backend": "torchcodec",
+    "eval_split": 0.1
+  },
+  "policy": {
+    "type": "pi05",
+    "pretrained_path": "lerobot/pi05_base",
+    "device": "cuda",
+    "dtype": "float32",
+    "chunk_size": 50,
+    "n_action_steps": 25,
+    "empty_cameras": 0,
+    "train_expert_only": false,
+    "freeze_vision_encoder": false,
+    "gradient_checkpointing": true,
+    "use_relative_actions": false,
+    "normalization_mapping": {
+      "ACTION": "QUANTILES",
+      "STATE": "QUANTILES",
+      "VISUAL": "IDENTITY"
+    },
+    "optimizer_lr": 2.5e-5,
+    "scheduler_warmup_steps": 15,
+    "scheduler_decay_steps": 448,
+    "scheduler_decay_lr": 2.5e-6,
+    "push_to_hub": false
+  },
+  "peft": null,
+  "parallelism": {
+    "dp_shard": 4
+  },
+  "accelerator": {
+    "mixed_precision": "bf16",
+    "gradient_accumulation": {
+      "steps": 1
+    }
+  },
+  "batch_size": 32,
+  "num_workers": 8,
+  "steps": 448,
+  "eval_steps": 224,
+  "max_eval_samples": 0,
+  "log_freq": 10,
+  "save_freq": 224,
+  "seed": 42,
+  "preserve_pretrained_processor_stats": false,
+  "output_dir": "outputs/train/pi05_base_dual_ur5_full_finetune",
+  "job_name": "pi05_base_dual_ur5_full_finetune",
+  "wandb": {
+    "enable": true,
+    "disable_artifact": true,
+    "project": "pi05-dual-ur5"
+  }
+}
