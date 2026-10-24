@@ -918,6 +918,9 @@ class PI05Policy(PreTrainedPolicy):
     config_class = PI05Config
     name = "pi05"
 
+    # Joint attention bypasses decoder-layer forward hooks; MLPs and vision blocks are called normally.
+    _fsdp_wrap_modules = ["GemmaMLP", "SiglipEncoderLayer", "Embedding"]
+
     def supports_rtc(self) -> bool:
         return True
 
