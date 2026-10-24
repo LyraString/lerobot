@@ -148,8 +148,9 @@ def test_native_lora_loads_a_weights_only_base(tiny_policy, tmp_path):
         torch.testing.assert_close(native.state_dict()[key], value, rtol=0, atol=0)
 
 
-def test_native_lora_missing_weights_do_not_return_random_policy(tiny_policy, tmp_path):
-    config = PI05Config(device="cpu", native_lora=PI05NativeLoRAConfig())
+@pytest.mark.parametrize("native_lora", [None, PI05NativeLoRAConfig()])
+def test_missing_weights_do_not_return_random_policy(tiny_policy, tmp_path, native_lora):
+    config = PI05Config(device="cpu", native_lora=native_lora)
     with pytest.raises(OSError):
         tiny_policy.from_pretrained(tmp_path, config=config, local_files_only=True)
 

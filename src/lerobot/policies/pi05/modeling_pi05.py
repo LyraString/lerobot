@@ -991,96 +991,82 @@ class PI05Policy(PreTrainedPolicy):
         model = cls(config, **kwargs)
 
         # Load state dict (expects keys with "model." prefix)
-        try:
-            print(f"Loading model from: {pretrained_name_or_path}")
-            try:
-                from transformers.utils import cached_file
+        print(f"Loading model from: {pretrained_name_or_path}")
+        from transformers.utils import cached_file
 
-                resolved_file = cached_file(
-                    pretrained_name_or_path,
-                    "model.safetensors",
-                    cache_dir=cache_dir,
-                    force_download=force_download,
-                    resume_download=resume_download,
-                    proxies=proxies,
-                    token=token,
-                    revision=revision,
-                    local_files_only=local_files_only,
-                )
-                from safetensors.torch import load_file
+        resolved_file = cached_file(
+            pretrained_name_or_path,
+            "model.safetensors",
+            cache_dir=cache_dir,
+            force_download=force_download,
+            resume_download=resume_download,
+            proxies=proxies,
+            token=token,
+            revision=revision,
+            local_files_only=local_files_only,
+        )
+        from safetensors.torch import load_file
 
-                original_state_dict = load_file(resolved_file)
-                print("✓ Loaded state dict from model.safetensors")
-            except Exception as e:
-                if model.config.native_lora is not None:
-                    raise
-                print(f"Could not load state dict from remote files: {e}")
-                print("Returning model without loading pretrained weights")
-                return model
+        original_state_dict = load_file(resolved_file)
+        print("✓ Loaded state dict from model.safetensors")
+        # First, fix any key differences (see openpi model.py, _fix_pytorch_state_dict_keys)
+        fixed_state_dict = model._fix_pytorch_state_dict_keys(original_state_dict, model.config)
 
-            # First, fix any key differences (see openpi model.py, _fix_pytorch_state_dict_keys)
-            fixed_state_dict = model._fix_pytorch_state_dict_keys(original_state_dict, model.config)
+        # Then add "model." prefix for all keys that don't already have it
+        remapped_state_dict = {}
+        remap_count = 0
 
-            # Then add "model." prefix for all keys that don't already have it
-            remapped_state_dict = {}
-            remap_count = 0
+        for key, value in fixed_state_dict.items():
+            if not key.startswith("model."):
+                new_key = f"model.{key}"
+                remapped_state_dict[new_key] = value
+                remap_count += 1
+            else:
+                remapped_state_dict[key] = value
 
-            for key, value in fixed_state_dict.items():
-                if not key.startswith("model."):
-                    new_key = f"model.{key}"
-                    remapped_state_dict[new_key] = value
-                    remap_count += 1
-                else:
-                    remapped_state_dict[key] = value
+        if remap_count > 0:
+            print(f"Remapped {remap_count} state dict keys")
 
-            if remap_count > 0:
-                print(f"Remapped {remap_count} state dict keys")
+        initialize_lora = False
+        if model.config.native_lora is not None:
+            # A weights-only OpenPI base is valid. Native checkpoints written by
+            # save_pretrained include config.json beside the same weight snapshot.
+            source_config_file = Path(resolved_file).parent / "config.json"
+            source_native_lora = None
+            if source_config_file.is_file():
+                with source_config_file.open() as f:
+                    source_native_lora = json.load(f).get("native_lora")
+            has_adapters = any(key.endswith((".lora_a", ".lora_b")) for key in remapped_state_dict)
+            initialize_lora = source_native_lora is None and not has_adapters
+        remapped_state_dict = model._prepare_pretrained_state_dict(
+            remapped_state_dict, initialize_lora=initialize_lora
+        )
 
-            initialize_lora = False
-            if model.config.native_lora is not None:
-                # A weights-only OpenPI base is valid. Native checkpoints written by
-                # save_pretrained include config.json beside the same weight snapshot.
-                source_config_file = Path(resolved_file).parent / "config.json"
-                source_native_lora = None
-                if source_config_file.is_file():
-                    with source_config_file.open() as f:
-                        source_native_lora = json.load(f).get("native_lora")
-                has_adapters = any(key.endswith((".lora_a", ".lora_b")) for key in remapped_state_dict)
-                initialize_lora = source_native_lora is None and not has_adapters
-            remapped_state_dict = model._prepare_pretrained_state_dict(
-                remapped_state_dict, initialize_lora=initialize_lora
-            )
+        # Load the remapped state dict into the model
+        missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=strict)
 
-            # Load the remapped state dict into the model
-            missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=strict)
+        if missing_keys:
+            print(f"Missing keys when loading state dict: {len(missing_keys)} keys")
+            if len(missing_keys) <= 5:
+                for key in missing_keys:
+                    print(f"  - {key}")
+            else:
+                for key in missing_keys[:5]:
+                    print(f"  - {key}")
+                print(f"  ... and {len(missing_keys) - 5} more")
 
-            if missing_keys:
-                print(f"Missing keys when loading state dict: {len(missing_keys)} keys")
-                if len(missing_keys) <= 5:
-                    for key in missing_keys:
-                        print(f"  - {key}")
-                else:
-                    for key in missing_keys[:5]:
-                        print(f"  - {key}")
-                    print(f"  ... and {len(missing_keys) - 5} more")
+        if unexpected_keys:
+            print(f"Unexpected keys when loading state dict: {len(unexpected_keys)} keys")
+            if len(unexpected_keys) <= 5:
+                for key in unexpected_keys:
+                    print(f"  - {key}")
+            else:
+                for key in unexpected_keys[:5]:
+                    print(f"  - {key}")
+                print(f"  ... and {len(unexpected_keys) - 5} more")
 
-            if unexpected_keys:
-                print(f"Unexpected keys when loading state dict: {len(unexpected_keys)} keys")
-                if len(unexpected_keys) <= 5:
-                    for key in unexpected_keys:
-                        print(f"  - {key}")
-                else:
-                    for key in unexpected_keys[:5]:
-                        print(f"  - {key}")
-                    print(f"  ... and {len(unexpected_keys) - 5} more")
-
-            if not missing_keys and not unexpected_keys:
-                print("All keys loaded successfully!")
-
-        except Exception as e:
-            if model.config.native_lora is not None:
-                raise
-            print(f"Warning: Could not load state dict: {e}")
+        if not missing_keys and not unexpected_keys:
+            print("All keys loaded successfully!")
 
         return model
 
