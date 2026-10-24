@@ -143,6 +143,10 @@ def save_sharded_optimizer(
     """
     from accelerate.utils import save_fsdp_optimizer
 
+    if accelerator.device.type == "cuda":
+        torch.cuda.synchronize(accelerator.device)
+        torch.cuda.empty_cache()
+
     save_fsdp_optimizer(_fsdp_plugin(accelerator), accelerator, optimizer, model, str(output_dir))
 
 
