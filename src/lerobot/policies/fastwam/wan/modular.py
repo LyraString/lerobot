@@ -1005,6 +1005,7 @@ class FastWAM(torch.nn.Module):
         self.vae._apply(fn)
         if self.text_encoder is not None:
             self.text_encoder._apply(fn)
+        self.device = next(self.mot.parameters()).device
         return self
 
     @staticmethod

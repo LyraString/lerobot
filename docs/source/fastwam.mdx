@@ -118,6 +118,24 @@ lerobot-rollout \
 
 FastWAM loads the Wan VAE, video DiT, text encoder, and tokenizer from the configured Wan model directory or Hugging Face Hub model id. LeRobot-format FastWAM checkpoints saved by `save_pretrained` also copy the local Wan component files needed by `from_pretrained`.
 
+### FSDP Initialization on CPU
+
+For multi-GPU training, load the policy on CPU before FSDP2 moves its parameter
+shards to the GPUs:
+
+```bash
+--parallelism.dp_shard=4 \
+--accelerator.mixed_precision=bf16 \
+--accelerator.fsdp.cpu_init=true
+```
+
+This avoids keeping the full FP32 policy and the new GPU shards in GPU memory
+at the same time during initialization. Training keeps parameter shards,
+gradients, and optimizer states on the GPUs; leave `cpu_offload=false`.
+The frozen VAE and text encoder move to each GPU after sharding. This option
+reduces initialization memory, while forward and backward still need their
+own GPU memory.
+
 ### Attention Backend
 
 FastWAM's DiT uses PyTorch's `scaled_dot_product_attention` (SDPA) for all attention. It does **not** use FlashAttention: its Mixture-of-Transformers (MoT) routing needs arbitrary boolean `[query, key]` attention masks, which the FlashAttention varlen API cannot express. Installing the `flash-attn` package therefore has no effect on the FastWAM path. (Note that SDPA itself may still select PyTorch's own flash / memory-efficient / math kernel internally — this is unrelated to the `flash-attn` package.)

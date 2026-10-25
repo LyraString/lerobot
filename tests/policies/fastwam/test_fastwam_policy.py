@@ -46,6 +46,25 @@ class FakeFastWAMCore(nn.Module):
         return {"action": torch.ones(1, kwargs["action_horizon"], 3)}
 
 
+def test_core_device_follows_parent_module_device_move():
+    video, action = nn.Linear(2, 2), nn.Linear(2, 2)
+    core = FastWAM(
+        video_expert=video,
+        action_expert=action,
+        mot=nn.ModuleDict({"video": video, "action": action}),
+        vae=nn.Linear(2, 2),
+        text_encoder=nn.Linear(2, 2),
+        text_dim=2,
+    )
+    # Parent._apply, rather than core.to(), is how the training policy moves the core.
+    nn.Sequential(core).to("meta")
+
+    assert core.device == torch.device("meta")
+    assert core.vae.weight.device == core.device
+    assert core.text_encoder.weight.device == core.device
+    assert core.torch_dtype == torch.float32
+
+
 def test_fastwam_is_registered_and_publicly_exported():
     cfg = make_policy_config(
         "fastwam",

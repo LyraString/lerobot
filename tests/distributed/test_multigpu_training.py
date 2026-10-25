@@ -43,11 +43,13 @@ Mechanics:
   collect and run in the CPU lanes.
 """
 
+import copy
 import json
 import os
 import socket
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -130,6 +132,95 @@ def _init_worker_env(rank: int, world_size: int, port: int) -> None:
     # The fp32 parity tolerances below assume true-fp32 matmuls.
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
+
+
+def _cpu_init_worker(rank: int, world_size: int, port: int, tmp_dir: str, cpu_init: bool) -> None:
+    from torch import nn
+    from torch.utils.data import DataLoader
+
+    from lerobot.scripts import lerobot_train
+
+    _init_worker_env(rank, world_size, port)
+    cfg = _make_cfg(world_size, dp_shard=world_size)
+    cfg.policy = DummyCheckpointConfig(hidden=HIDDEN, device="cuda", push_to_hub=False)
+    cfg.accelerator.mixed_precision = "bf16"
+    cfg.accelerator.fsdp.cpu_init = cpu_init
+    cfg.output_dir = Path(tmp_dir) / "train"
+    cfg.steps = SAVE_STEP
+    cfg.log_freq = cfg.env_eval_freq = 0
+    cfg.save_checkpoint = cfg.wandb.enable = False
+    dataset = SimpleNamespace(num_frames=32, num_episodes=1, meta=SimpleNamespace(stats={}, camera_keys=[]))
+    reference = None
+    trained_state = None
+
+    class PolicyWithFrozenEncoder(DummyCheckpointPolicy):
+        """Like FastWAM, keep a frozen encoder outside the FSDP module tree."""
+
+        def __init__(self, config):
+            super().__init__(config)
+            object.__setattr__(self, "encoder", nn.Linear(HIDDEN, HIDDEN).requires_grad_(False))
+            self.to(device=config.device, dtype=torch.bfloat16)
+
+        def _apply(self, fn, *args, **kwargs):
+            super()._apply(fn, *args, **kwargs)
+            self.encoder._apply(fn)
+            return self
+
+        def forward(self, batch):
+            return super().forward({"observation.state": self.encoder(batch["observation.state"])})
+
+    def make_policy(cfg, **kwargs):
+        nonlocal reference
+        assert cfg.device == ("cpu" if cpu_init else "cuda")
+        policy = PolicyWithFrozenEncoder(cfg)
+        assert next(policy.parameters()).device.type == cfg.device
+        reference = copy.deepcopy(policy).to(torch.device("cuda", rank))
+        reference.net.float()  # Accelerate keeps FSDP master parameters in FP32.
+        return policy
+
+    original_update = lerobot_train.update_policy
+
+    def update_policy(tracker, policy, batch, optimizer, *args, **kwargs):
+        nonlocal trained_state
+        assert cfg.policy.device == "cuda"
+        assert is_sharded_module(policy)
+        assert policy.encoder.weight.device == torch.device("cuda", rank)
+        assert type(kwargs["accelerator"].state.fsdp_plugin.cpu_offload).__name__ == "OffloadPolicy"
+        result = original_update(tracker, policy, batch, optimizer, *args, **kwargs)
+        for state in optimizer.state.values():
+            assert state["exp_avg"].device == torch.device("cuda", rank)
+            assert state["exp_avg_sq"].device == torch.device("cuda", rank)
+        torch.testing.assert_close(policy.encoder.weight, reference.encoder.weight, rtol=0, atol=0)
+        trained_state = full_model_state_dict(policy)
+        return result
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(lerobot_train, "make_train_eval_datasets", lambda cfg: (dataset, None))
+        patch.setattr(lerobot_train, "make_policy", make_policy)
+        patch.setattr(lerobot_train, "make_pre_post_processors", lambda **kwargs: (lambda x: x, lambda x: x))
+        patch.setattr(
+            lerobot_train,
+            "make_dataloaders",
+            lambda *args: (
+                DataLoader([{"observation.state": torch.ones(HIDDEN)}] * 32, batch_size=BATCH_SIZE),
+                None,
+            ),
+        )
+        patch.setattr(lerobot_train, "update_policy", update_policy)
+        lerobot_train.train(cfg)
+
+    if rank == 0:
+        # Both initialization modes must produce the same updates as an unsharded model.
+        optimizer = cfg.optimizer.build(reference.parameters())
+        for _ in range(cfg.steps):
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                loss, _ = reference({"observation.state": torch.ones(BATCH_SIZE, HIDDEN, device="cuda")})
+            loss.backward()
+            nn.utils.clip_grad_norm_(reference.parameters(), cfg.optimizer.grad_clip_norm)
+            optimizer.step()
+            optimizer.zero_grad()
+        for name, param in reference.state_dict().items():
+            torch.testing.assert_close(trained_state[name].cpu(), param.cpu(), rtol=0, atol=1e-6)
 
 
 # -------------------------------------------------------------------------------------------
@@ -404,6 +495,14 @@ def _grad_accum_worker(
 # -------------------------------------------------------------------------------------------
 # Tests
 # -------------------------------------------------------------------------------------------
+
+
+@pytest.mark.multigpu
+@pytest.mark.skipif(torch.cuda.device_count() < 4, reason="requires 4 GPUs")
+@pytest.mark.parametrize("cpu_init", [False, True])
+def test_fsdp2_initialization_placement(tmp_path, cpu_init):
+    """Exercise the real training entry point, including its post-sharding device move."""
+    _spawn(4, _cpu_init_worker, str(tmp_path), cpu_init)
 
 
 @pytest.mark.multigpu

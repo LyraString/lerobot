@@ -40,6 +40,10 @@ class TestFieldValidation:
         with pytest.raises(ValueError, match="min_num_params"):
             FSDPConfig(min_num_params=0)
 
+    def test_cpu_init_requires_gpu_resident_training(self):
+        with pytest.raises(ValueError, match="cpu_offload=False"):
+            FSDPConfig(cpu_init=True, cpu_offload=True)
+
     def test_mixed_precision_choices(self):
         with pytest.raises(ValueError, match="mixed_precision"):
             AcceleratorConfig(mixed_precision="tf32")
@@ -68,6 +72,7 @@ class TestDraccusRoundTrip:
                 activation_checkpointing=ActivationCheckpointingConfig(mode=ActivationCheckpointingMode.FULL),
             ),
             AcceleratorConfig(fsdp=FSDPConfig(min_num_params=1_000_000)),
+            AcceleratorConfig(fsdp=FSDPConfig(cpu_init=True)),
         ],
     )
     def test_encode_json_decode_identity(self, cfg):

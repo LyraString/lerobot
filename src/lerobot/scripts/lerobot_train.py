@@ -437,6 +437,7 @@ def train(cfg: TrainPipelineConfig):
     parallel_dims = ParallelDims.from_config(
         cfg.parallelism, accelerator.num_processes, accelerator.device.type
     )
+    cpu_init = parallel_dims.is_sharded and cfg.accelerator.fsdp.cpu_init
     init_logging(accelerator=accelerator)
 
     if is_main_process():
@@ -491,12 +492,16 @@ def train(cfg: TrainPipelineConfig):
     else:
         if is_main_process():
             logging.info("Creating policy")
+        policy_device = cfg.policy.device
+        if cpu_init:
+            cfg.policy.device = "cpu"
         policy = make_policy(
             cfg=cfg.policy,
             ds_meta=dataset.meta,
             rename_map=cfg.rename_map,
             defer_weight_load=defer_weight_load,
         )
+        cfg.policy.device = policy_device
 
     peft_model = None
     if cfg.peft is not None:
@@ -610,6 +615,9 @@ def train(cfg: TrainPipelineConfig):
         policy, optimizer, dataloader, lr_scheduler = accelerator.prepare(
             policy, optimizer, dataloader, lr_scheduler
         )
+    if cpu_init:
+        # FSDP placed registered parameters; also move unregistered frozen components.
+        policy.to(device)
     finalize_sharded_policy(policy, parallel_dims)
     if cfg.resume:
         resume_after_prepare(cfg, accelerator, policy, optimizer, lr_scheduler)

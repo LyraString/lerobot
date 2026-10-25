@@ -38,7 +38,7 @@ if TYPE_CHECKING:
 
 @dataclass
 class FSDPConfig:
-    """Mirror of the `FullyShardedDataParallelPlugin` subset LeRobot supports (FSDP2 only).
+    """FSDP2 plugin settings and policy initialization placement.
 
     Exactly one wrap policy applies: `wrap_modules` (module *class names* forming the FSDP
     units — and, later, the activation-checkpointing units) or `min_num_params` (size-based).
@@ -50,15 +50,18 @@ class FSDPConfig:
     wrap_modules: list[str] | None = None
     min_num_params: int | None = None
     cpu_offload: bool = False
+    # Load the policy on CPU before FSDP places its shards on the training device.
+    cpu_init: bool = False
     # Regex matched against module FQNs to exclude their parameters from sharding.
     ignored_modules: str | None = None
 
     def __post_init__(self) -> None:
-        """Validate the wrap-policy fields.
+        """Validate wrapping and initialization settings.
 
         Raises:
             ValueError: If both ``wrap_modules`` and ``min_num_params`` are set (they are
-                mutually exclusive wrap policies), or if ``min_num_params`` is < 1.
+                mutually exclusive wrap policies), if ``min_num_params`` is < 1, or if
+                ``cpu_init`` is combined with persistent CPU offload.
         """
         if self.wrap_modules is not None and self.min_num_params is not None:
             raise ValueError(
@@ -66,6 +69,8 @@ class FSDPConfig:
             )
         if self.min_num_params is not None and self.min_num_params < 1:
             raise ValueError(f"fsdp.min_num_params must be >= 1, got {self.min_num_params}.")
+        if self.cpu_init and self.cpu_offload:
+            raise ValueError("fsdp.cpu_init requires cpu_offload=False for GPU-resident training.")
 
     def build_plugin(self) -> "FullyShardedDataParallelPlugin":
         """Build the FSDP2 plugin for `Accelerator(fsdp_plugin=...)`.
