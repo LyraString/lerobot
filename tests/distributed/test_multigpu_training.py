@@ -134,10 +134,13 @@ def _init_worker_env(rank: int, world_size: int, port: int) -> None:
     torch.backends.cudnn.allow_tf32 = False
 
 
-def _cpu_init_worker(rank: int, world_size: int, port: int, tmp_dir: str, cpu_init: bool) -> None:
+def _cpu_init_worker(
+    rank: int, world_size: int, port: int, tmp_dir: str, cpu_init: bool, fused: bool | None
+) -> None:
     from torch import nn
     from torch.utils.data import DataLoader
 
+    from lerobot.policies.fastwam.configuration_fastwam import FastWAMConfig
     from lerobot.scripts import lerobot_train
 
     _init_worker_env(rank, world_size, port)
@@ -184,6 +187,7 @@ def _cpu_init_worker(rank: int, world_size: int, port: int, tmp_dir: str, cpu_in
         nonlocal trained_state
         assert cfg.policy.device == "cuda"
         assert is_sharded_module(policy)
+        assert optimizer.param_groups[0]["fused"] is fused
         assert policy.encoder.weight.device == torch.device("cuda", rank)
         assert type(kwargs["accelerator"].state.fsdp_plugin.cpu_offload).__name__ == "OffloadPolicy"
         result = original_update(tracker, policy, batch, optimizer, *args, **kwargs)
@@ -195,6 +199,11 @@ def _cpu_init_worker(rank: int, world_size: int, port: int, tmp_dir: str, cpu_in
         return result
 
     with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(
+            DummyCheckpointConfig,
+            "get_optimizer_preset",
+            lambda self: FastWAMConfig(optimizer_fused=fused, device="cpu").get_optimizer_preset(),
+        )
         patch.setattr(lerobot_train, "make_train_eval_datasets", lambda cfg: (dataset, None))
         patch.setattr(lerobot_train, "make_policy", make_policy)
         patch.setattr(lerobot_train, "make_pre_post_processors", lambda **kwargs: (lambda x: x, lambda x: x))
@@ -315,7 +324,9 @@ def _assert_tree_equal(reference, actual, path: str) -> None:
 # -------------------------------------------------------------------------------------------
 
 
-def _train_and_save_worker(rank: int, world_size: int, port: int, tmp_dir: str, fmt_value: str) -> None:
+def _train_and_save_worker(
+    rank: int, world_size: int, port: int, tmp_dir: str, fmt_value: str, fused: bool | None = None
+) -> None:
     """FSDP2 (dp_shard=world_size): train SAVE_STEP steps, save_checkpoint, store the gathered
     full model/optimizer state as the rank-0 reference for the resume workers."""
     _init_worker_env(rank, world_size, port)
@@ -324,7 +335,7 @@ def _train_and_save_worker(rank: int, world_size: int, port: int, tmp_dir: str, 
     cfg = _make_cfg(world_size, dp_shard=world_size, checkpoint_format=fmt)
     accelerator = _build_accelerator(cfg)
     policy = _make_policy(SEED)
-    optimizer = torch.optim.Adam(policy.parameters(), lr=1e-2)
+    optimizer = torch.optim.Adam(policy.parameters(), lr=1e-2, fused=fused)
     # FSDP2 requires model and optimizer in one prepare() call (accelerate rebinds param groups).
     policy, optimizer = accelerator.prepare(policy, optimizer)
     assert is_sharded_module(accelerator.unwrap_model(policy)), "prepare() did not shard the policy"
@@ -357,7 +368,9 @@ def _train_and_save_worker(rank: int, world_size: int, port: int, tmp_dir: str, 
     dist.destroy_process_group()
 
 
-def _resume_and_verify_worker(rank: int, world_size: int, port: int, tmp_dir: str, fmt_value: str) -> None:
+def _resume_and_verify_worker(
+    rank: int, world_size: int, port: int, tmp_dir: str, fmt_value: str, fused: bool | None = None
+) -> None:
     """Two-phase resume at dp_shard=world_size; the gathered state must match the saved
     reference exactly (DCP round-trips are bit-exact)."""
     _init_worker_env(rank, world_size, port)
@@ -370,7 +383,7 @@ def _resume_and_verify_worker(rank: int, world_size: int, port: int, tmp_dir: st
 
     # Deliberately different init: the DCP load must overwrite every parameter.
     policy = _make_policy(SEED + 1)
-    optimizer = torch.optim.Adam(policy.parameters(), lr=1e-2)
+    optimizer = torch.optim.Adam(policy.parameters(), lr=1e-2, fused=fused)
     policy, optimizer = accelerator.prepare(policy, optimizer)
     resume_after_prepare(cfg, accelerator, policy, optimizer, None)  # phase 2: DCP reshard-load
 
@@ -499,15 +512,16 @@ def _grad_accum_worker(
 
 @pytest.mark.multigpu
 @pytest.mark.skipif(torch.cuda.device_count() < 4, reason="requires 4 GPUs")
-@pytest.mark.parametrize("cpu_init", [False, True])
-def test_fsdp2_initialization_placement(tmp_path, cpu_init):
+@pytest.mark.parametrize("cpu_init, fused", [(False, None), (True, None), (True, True)])
+def test_fsdp2_initialization_placement(tmp_path, cpu_init, fused):
     """Exercise the real training entry point, including its post-sharding device move."""
-    _spawn(4, _cpu_init_worker, str(tmp_path), cpu_init)
+    _spawn(4, _cpu_init_worker, str(tmp_path), cpu_init, fused)
 
 
 @pytest.mark.multigpu
 @pytest.mark.skipif(torch.cuda.device_count() < 4, reason="requires 4 GPUs")
-def test_fsdp2_train_save_resume_round_trip(tmp_path):
+@pytest.mark.parametrize("fused", [None, True])
+def test_fsdp2_train_save_resume_round_trip(tmp_path, fused):
     """FSDP2 dp_shard=4, checkpoint_format=safetensors_dcp: train -> save_checkpoint -> resume.
 
     A second spawn resumes through the two-phase path and its gathered model weights and Adam
@@ -515,8 +529,8 @@ def test_fsdp2_train_save_resume_round_trip(tmp_path):
     bit-exact).
     """
     fmt = CheckpointFormat.SAFETENSORS_AND_DCP.value
-    _spawn(4, _train_and_save_worker, str(tmp_path), fmt)
-    _spawn(4, _resume_and_verify_worker, str(tmp_path), fmt)
+    _spawn(4, _train_and_save_worker, str(tmp_path), fmt, fused)
+    _spawn(4, _resume_and_verify_worker, str(tmp_path), fmt, fused)
 
 
 @pytest.mark.multigpu

@@ -136,6 +136,12 @@ The frozen VAE and text encoder move to each GPU after sharding. This option
 reduces initialization memory, while forward and backward still need their
 own GPU memory.
 
+### Fused Optimizer
+
+Set `--policy.optimizer_fused=true` to use PyTorch's fused AdamW implementation.
+The default is `None`, preserving PyTorch's implementation selection. This flag
+is ignored when resuming: the optimizer is rebuilt from the saved training configuration.
+
 ### Attention Backend
 
 FastWAM's DiT uses PyTorch's `scaled_dot_product_attention` (SDPA) for all attention. It does **not** use FlashAttention: its Mixture-of-Transformers (MoT) routing needs arbitrary boolean `[query, key]` attention masks, which the FlashAttention varlen API cannot express. Installing the `flash-attn` package therefore has no effect on the FastWAM path. (Note that SDPA itself may still select PyTorch's own flash / memory-efficient / math kernel internally — this is unrelated to the `flash-attn` package.)

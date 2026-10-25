@@ -234,6 +234,7 @@ class FastWAMConfig(PreTrainedConfig):
     output_features: dict[str, PolicyFeature] | None = None
     optimizer_lr: float = 1.0e-4
     optimizer_weight_decay: float = 1.0e-2
+    optimizer_fused: bool | None = None
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -284,7 +285,11 @@ class FastWAMConfig(PreTrainedConfig):
             self.pretrained_path = pretrained_path
 
     def get_optimizer_preset(self) -> AdamWConfig:
-        return AdamWConfig(lr=self.optimizer_lr, weight_decay=self.optimizer_weight_decay)
+        return AdamWConfig(
+            lr=self.optimizer_lr,
+            weight_decay=self.optimizer_weight_decay,
+            fused=self.optimizer_fused,
+        )
 
     def get_scheduler_preset(self) -> None:
         return None
