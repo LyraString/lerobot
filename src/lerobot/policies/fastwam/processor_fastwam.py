@@ -14,22 +14,98 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import json
+from dataclasses import dataclass, field
 from typing import Any
 
 import torch
+from safetensors import safe_open
 
 from lerobot.configs import PipelineFeatureType, PolicyFeature
+from lerobot.lerobot_types import EnvTransition, TransitionKey
 from lerobot.processor import (
     ActionProcessorStep,
     PolicyAction,
     PolicyProcessorPipeline,
+    ProcessorStep,
     ProcessorStepRegistry,
     make_default_policy_processor_steps,
     make_policy_processor_pipelines,
 )
 
 from .configuration_fastwam import FastWAMConfig
+
+
+def text_context_config(config: FastWAMConfig) -> dict[str, Any]:
+    """Settings that must match when reusing frozen text embeddings."""
+    return {
+        name: getattr(config, name)
+        for name in (
+            "text_encoder_model_id",
+            "tokenizer_model_id",
+            "tokenizer_max_len",
+            "prompt_template",
+            "torch_dtype",
+        )
+    }
+
+
+@dataclass
+@ProcessorStepRegistry.register(name="fastwam_text_context_processor")
+class FastWAMTextContextProcessorStep(ProcessorStep):
+    """Look up frozen text embeddings; pipeline serialization carries them into checkpoints."""
+
+    tasks: list[str]
+    encoding_config: dict[str, Any]
+    _state: dict[str, torch.Tensor] = field(default_factory=dict, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self._task_indices = {task: index for index, task in enumerate(self.tasks)}
+
+    def __call__(self, transition: EnvTransition) -> EnvTransition:
+        transition = transition.copy()
+        extras = transition[TransitionKey.COMPLEMENTARY_DATA].copy()
+        tasks = extras["task"]
+        tasks = [tasks] if isinstance(tasks, str) else tasks
+        indices = [self._task_indices[task] for task in tasks]
+        extras.update({key: value[indices] for key, value in self._state.items()})
+        transition[TransitionKey.COMPLEMENTARY_DATA] = extras
+        return transition
+
+    def get_config(self) -> dict[str, Any]:
+        return {"tasks": self.tasks, "encoding_config": self.encoding_config}
+
+    def state_dict(self) -> dict[str, torch.Tensor]:
+        return self._state
+
+    def load_state_dict(self, state: dict[str, torch.Tensor]) -> None:
+        self._state = state
+
+    def transform_features(
+        self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
+    ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
+        return features
+
+
+def reconcile_fastwam_preprocessor(
+    config: FastWAMConfig, preprocessor: PolicyProcessorPipeline
+) -> PolicyProcessorPipeline:
+    """Attach the cache when adapting base processors; reuse checkpoint state on resume."""
+    cached_step = next(
+        (step for step in preprocessor.steps if isinstance(step, FastWAMTextContextProcessorStep)), None
+    )
+    if cached_step is None and config.text_context_cache is not None:
+        with safe_open(config.text_context_cache, framework="pt", device="cpu") as cache:
+            metadata = cache.metadata()
+            cached_step = FastWAMTextContextProcessorStep(
+                tasks=json.loads(metadata["tasks"]), encoding_config=json.loads(metadata["encoding_config"])
+            )
+            cached_step.load_state_dict({key: cache.get_tensor(key) for key in ("context", "context_mask")})
+        # Insert before device transfer so cached tensors follow the batch onto its GPU.
+        preprocessor.steps.insert(0, cached_step)
+    if cached_step is not None and cached_step.encoding_config != text_context_config(config):
+        raise ValueError("FastWAM text cache encoding settings differ from the policy configuration.")
+    return preprocessor
 
 
 @dataclass
@@ -112,4 +188,7 @@ def make_fastwam_pre_post_processors(
             FastWAMActionToggleProcessorStep(toggle_dimensions=config.toggle_action_dimensions)
         )
     output_steps.append(steps.to_cpu)
-    return make_policy_processor_pipelines(input_steps=input_steps, output_steps=output_steps)
+    preprocessor, postprocessor = make_policy_processor_pipelines(
+        input_steps=input_steps, output_steps=output_steps
+    )
+    return reconcile_fastwam_preprocessor(config, preprocessor), postprocessor

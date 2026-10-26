@@ -17,6 +17,10 @@ from lerobot.inference import ExecutionMode, FeatureSpec, ObservationSnapshot, R
 from lerobot.policies import make_pre_post_processors
 from lerobot.policies.fastwam.configuration_fastwam import FastWAMConfig
 from lerobot.policies.fastwam.modeling_fastwam import FastWAMPolicy
+from lerobot.policies.fastwam.processor_fastwam import (
+    FastWAMTextContextProcessorStep,
+    text_context_config,
+)
 from lerobot.remote_inference import PolicyServer, SessionWorker, load_deployment
 from lerobot.remote_inference.client import RemoteClient
 from lerobot.remote_inference.configs import ExecutionConfig, ModelConfig, ServerConfig
@@ -40,6 +44,8 @@ class TinyCore(nn.Module):
     def infer_action(self, **kwargs):
         assert kwargs["input_image"].shape == (1, 3, 2, 4)
         values = self.dit(kwargs["proprio"]) + kwargs["input_image"].mean()
+        if kwargs.get("context") is not None:
+            values = values + kwargs["context"].mean()
         return {"action": values.unsqueeze(1).repeat(1, kwargs["action_horizon"], 1)}
 
 
@@ -134,6 +140,39 @@ def test_fastwam_rejects_bad_camera_state_and_rtc_contracts(saved_fastwam):
     runner.policy.config.n_obs_steps = 2
     with pytest.raises(ValueError, match="n_obs_steps=1"):
         runner.policy.chunk_inference_spec()
+
+
+def test_saved_text_cache_supports_task_warmup_without_original_training_cache(saved_fastwam):
+    path = saved_fastwam.model.repo_or_path
+    config = FastWAMConfig.from_pretrained(path)
+    pre, _ = make_pre_post_processors(config, pretrained_path=path)
+    config.load_text_encoder = False
+    config.text_context_cache = "/absent/training-only/text-cache.safetensors"
+    config.optimizer_fused = True
+    config.save_pretrained(path)
+    cached = FastWAMTextContextProcessorStep(
+        tasks=[snapshot().task], encoding_config=text_context_config(config)
+    )
+    cached.load_state_dict({"context": torch.ones(1, 2, 4), "context_mask": torch.ones(1, 2)})
+    pre.steps.insert(0, cached)
+    pre.save_pretrained(path)
+    deployment = replace(
+        saved_fastwam,
+        execution=replace(saved_fastwam.execution, warmup_task=snapshot().task),
+    )
+
+    runner, _ = load_deployment(deployment)
+    assert runner.policy.config.optimizer_fused is True
+    assert runner.policy.config.get_optimizer_preset().fused is True
+    batch = runner.preprocessor(runner._batch(snapshot()))
+    torch.testing.assert_close(batch["context"], torch.ones(1, 2, 4))
+    with torch.inference_mode():
+        expected = runner.postprocessor(runner.policy.select_action(batch))[0]
+    runner.reset()
+    result = runner.predict(snapshot()).canonical_actions
+    torch.testing.assert_close(result, expected.expand(2, -1))
+    with pytest.raises(KeyError):
+        runner.predict(replace(snapshot(), task="task absent from the saved cache"))
 
 
 @pytest.mark.parametrize("encoding", ["raw", "jpeg"])

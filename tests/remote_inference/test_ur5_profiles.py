@@ -23,6 +23,7 @@ def test_paired_ur5_templates_match_names_rates_and_camera_schema():
     assert client.inference.deployment == server.deployment
     assert client.inference.semantics == server.semantics
     assert client.fps == server.execution.action_fps == 20
+    assert server.execution.warmup_task == client.task
     assert server.action_feature.names == STATE_NAMES
     state = next(feature for feature in server.features if feature.name == "observation.state")
     assert state.names == STATE_NAMES

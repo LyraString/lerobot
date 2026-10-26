@@ -49,6 +49,8 @@ class ExecutionConfig:
     action_deadline_s: float = 5.0
     idle_timeout_s: float = 10.0
     warmup_calls: int = 2
+    # Cached text processors require a task available in the saved checkpoint.
+    warmup_task: str = "warmup"
     # Server-owned plain-chunk slice; never supplied by a connecting robot.
     n_action_steps: int | None = None
 
@@ -120,5 +122,10 @@ class ServerConfig:
                 raise ValueError("Serving rates and deadlines must be finite and positive")
         if type(self.execution.warmup_calls) is not int or self.execution.warmup_calls < 1:
             raise ValueError("At least one warmup call is required before advertising readiness")
+        if (
+            not isinstance(self.execution.warmup_task, str)
+            or len(self.execution.warmup_task) > self.language.max_input_chars
+        ):
+            raise ValueError("execution.warmup_task must be text within language.max_input_chars")
         # Checked here so a bad endpoint fails at parse time, before any checkpoint download.
         self.zenoh.validate()

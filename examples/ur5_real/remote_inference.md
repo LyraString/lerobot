@@ -5,6 +5,57 @@
 工作站采集观测并执行动作；服务器加载 checkpoint 及其 processor，返回反归一化动作块。
 工作站只需要能 SSH 到服务器，服务器不需要反向 SSH 到工作站。
 
+## 当前两台机器的启动命令
+
+工作站：`/home/carto317/zhj/lerobot`。服务器：`zhj@10.13.21.170`，
+仓库是 `/data0/zhj/lerobot`。两端使用 `feat/official-remote-inference`。
+服务器 YAML 已填写 `fastwam_base_dual_ur5_full_finetune_text_cache_bs4`
+的 `003574/pretrained_model`；已核对数据集 20 Hz、三路相机和左臂/右臂/夹爪的 14 维顺序。
+
+终端一登录服务器，选择当时空闲的 GPU，然后启动模型服务：
+
+```bash
+ssh zhj@10.13.21.170
+cd /data0/zhj/lerobot
+CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+  uv run --no-sync lerobot-policy-server \
+  --config_path=examples/ur5_real/remote_fastwam_server.yaml
+```
+
+等日志出现 `Policy server ready`。终端二在工作站保持 SSH 隧道：
+
+```bash
+ssh -N \
+  -L 127.0.0.1:17447:127.0.0.1:7447 \
+  -o ExitOnForwardFailure=yes \
+  -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
+  zhj@10.13.21.170
+```
+
+终端三在工作站运行只读验证：
+
+```bash
+cd /home/carto317/zhj/lerobot
+uv run --no-sync lerobot-rollout \
+  --config_path=examples/ur5_real/remote_rollout.yaml \
+  --robot.diagnostics_path="outputs/ur5_remote_$(date +%Y%m%d_%H%M%S).jsonl"
+```
+
+出现交互提示后输入 `/start`。默认采集并请求推理 5 秒，不下发运动或夹爪命令。
+真实观测、动作顺序及耗时检查通过后，再启动运动：
+
+```bash
+uv run --no-sync lerobot-rollout \
+  --config_path=examples/ur5_real/remote_rollout.yaml \
+  --robot.enable_motion=true --robot.enable_gripper=true \
+  --interactive=true --duration=0 \
+  --robot.diagnostics_path="outputs/ur5_remote_$(date +%Y%m%d_%H%M%S).jsonl"
+```
+
+输入 `/start` 开始，`/stop` 结束当前会话。此模型的文本缓存仅包含
+`Pick up the object and place it on the scales`；服务端 `execution.warmup_task`
+和客户端 `task` 均使用这个任务。改成其他文字前需要相应的文本嵌入。
+
 ## 移植范围
 
 - 官方 `ae2b57f12223c8c5184fcd814eb63cd9ce7de203`：PR #4937，包含推理模块迁移、
@@ -19,6 +70,9 @@
   `n_action_steps`；未来视频帧索引仅用于训练，在线只传当前观测。仅声明 `chunk` 模式。
 - FastWAM 保留模型内的图像缩放，校验相机名称和状态维度；不改变网络协议或模型计算。
 - UR5 声明支持保持位置，供官方客户端在等待动作时刷新最近下发的目标。
+- 从服务器训练代码移入已保存的文本缓存 processor 及配置兼容项；补入上游
+  Adam/AdamW 的 `fused` 字段，保留 checkpoint 的 `optimizer_fused` 设置。
+  服务端支持显式 `execution.warmup_task`，让预热使用 checkpoint 已缓存的真实任务。
 
 上游后续的外部 VLM、G1 SONIC 和全仓类型检查改动不属于这个双臂 FastWAM 移植。
 两台机器应使用本分支同一个经过验证的提交，不要混用旧 gRPC 服务和新 Zenoh 客户端。
@@ -35,8 +89,8 @@ uv sync --locked --extra remote --extra fastwam --extra dataset
 冻结的 Wan VAE、文本编码器和 tokenizer 所需缓存也必须可用。
 不要用 LIBERO 的动作维度、夹爪翻转设置或统计量替代实机训练配置。
 
-`remote_fastwam_server.yaml` 是按现有三相机、14 维双臂约定写的模板，
-不是已经验证的 checkpoint 配置。核对训练时的相机名称、状态/动作顺序、
+`remote_fastwam_server.yaml` 已与 gpu57 的 003574 checkpoint 配置和数据集元数据核对；
+切换其他模型时重新核对训练时的相机名称、状态/动作顺序、
 `action_dim`、`proprio_dim`、`action_horizon`、`n_action_steps` 和采样频率。
 顺序为左臂六关节、右臂六关节、左夹爪、右夹爪；关节用弧度，夹爪 0=开、1=闭。
 FastWAM 在模型内把每张原始 RGB 图缩放到 checkpoint 配置的每相机尺寸后拼接。
@@ -47,6 +101,13 @@ FastWAM 在模型内把每张原始 RGB 图缩放到 checkpoint 配置的每相�
 uv run --no-sync lerobot-policy-server \
   --config_path=examples/ur5_real/remote_fastwam_server.yaml \
   --model.repo_or_path=/实际模型目录/pretrained_model
+```
+
+已有训练环境可以只补装通信依赖和刷新 editable 安装，避免重新同步整套 GPU 依赖：
+
+```bash
+uv pip install --python .venv/bin/python --no-deps -e . \
+  'eclipse-zenoh==1.10.1' 'msgpack==1.2.3'
 ```
 
 离线环境仅在所需组件缓存齐全时增加 `HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1`。

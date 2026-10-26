@@ -132,6 +132,12 @@ def test_transport_configuration_fails_before_resolving_checkpoint(deployment, m
         serving.load_deployment(replace(deployment, zenoh=transport))
 
 
+@pytest.mark.parametrize("task", [None, 123, "x" * 100_000])
+def test_invalid_warmup_task_fails_before_loading(deployment, task):
+    with pytest.raises(ValueError, match="warmup_task"):
+        replace(deployment, execution=replace(deployment.execution, warmup_task=task))
+
+
 def test_server_owned_execution_slice_does_not_modify_checkpoint(deployment):
     checkpoint_config = Path(deployment.model.repo_or_path) / "config.json"
     original = checkpoint_config.read_bytes()

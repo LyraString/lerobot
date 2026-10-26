@@ -176,7 +176,7 @@ def load_deployment(cfg: ServerConfig) -> tuple[PolicyRunner, str]:
     warmup = ObservationSnapshot(
         {feature.name: np.zeros(feature.shape, dtype=feature.dtype) for feature in cfg.features},
         0.0,
-        "warmup",
+        cfg.execution.warmup_task,
         observation_id="warmup",
     )
     try:
