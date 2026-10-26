@@ -56,6 +56,16 @@ uv run --no-sync lerobot-rollout \
 `Pick up the object and place it on the scales`；服务端 `execution.warmup_task`
 和客户端 `task` 均使用这个任务。改成其他文字前需要相应的文本嵌入。
 
+服务器安装通信依赖时保留了原有 Torch 等训练依赖。切换分支前的训练草稿完整保存在
+`refs/codex/fastwam-training-wip-20261026`，包括当时未跟踪的训练配置和文本缓存生成脚本。
+将来需要恢复训练现场时，先停止推理服务，确认当前工作区干净，再运行：
+
+```bash
+cd /data0/zhj/lerobot
+git switch feat/fastwam-libero
+git stash apply refs/codex/fastwam-training-wip-20261026
+```
+
 ## 移植范围
 
 - 官方 `ae2b57f12223c8c5184fcd814eb63cd9ce7de203`：PR #4937，包含推理模块迁移、
@@ -173,5 +183,10 @@ UR5 原有动作超时与故障锁存不做放宽；远程保持位置也不代�
 本次离线回归：605 passed、2 skipped；跳过的是需要额外 `zenohd` 二进制的
 router/mTLS 测试。直接 TCP/Zenoh、raw/JPEG、独立进程和 FastWAM 处理管线测试均已执行。
 `uv lock --check`、相关 Ruff 检查及格式检查通过；两个官方入口的 `--help` 可正常运行。
+
+真实 checkpoint 配置和完整 processor 文件另行复制到本地做 CPU 验证：
+14 维状态、`[1, 128, 4096]` 文本嵌入和 14 维反归一化动作均可加载并产生有限值。
+文本缓存兼容和任务预热补丁的回归为 316 passed、2 skipped，覆盖
+`tests/inference`、`tests/remote_inference`、FastWAM 策略和优化器测试。
 
 参考：[官方远程推理文档](https://huggingface.co/docs/lerobot/main/en/remote_inference)。

@@ -45,6 +45,7 @@ class TinyCore(nn.Module):
         assert kwargs["input_image"].shape == (1, 3, 2, 4)
         values = self.dit(kwargs["proprio"]) + kwargs["input_image"].mean()
         if kwargs.get("context") is not None:
+            assert kwargs["prompt"] is None, "The core forbids simultaneous prompt and cached context"
             values = values + kwargs["context"].mean()
         return {"action": values.unsqueeze(1).repeat(1, kwargs["action_horizon"], 1)}
 

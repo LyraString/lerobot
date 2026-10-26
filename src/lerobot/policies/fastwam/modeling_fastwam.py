@@ -338,8 +338,11 @@ def _scalar(value: Any) -> Any:
 
 
 def _batch_to_infer_kwargs(batch: dict[str, Tensor], config: FastWAMConfig) -> dict[str, Any]:
+    # A saved text-cache processor keeps task metadata alongside its embeddings.
+    # Only synthesize a prompt from that metadata when no context was supplied.
+    has_context = batch.get("context") is not None or batch.get("context_mask") is not None
     return {
-        "prompt": _prompt_from_batch(batch=batch, config=config),
+        "prompt": batch.get("prompt") if has_context else _prompt_from_batch(batch=batch, config=config),
         "input_image": _input_image_from_batch(batch, config),
         "action_horizon": config.action_horizon,
         "proprio": batch.get("proprio", batch.get(OBS_STATE)),
