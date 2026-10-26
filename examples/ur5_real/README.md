@@ -1,6 +1,10 @@
 # 双 UR5 CB3 实机 Rollout
 
 复用本仓库的 `lerobot-rollout`，无需自建策略服务器、通信协议或 VR/IK 推理流程。
+
+跨机器运行 FastWAM 使用官方远程入口，见 [远程推理说明](remote_inference.md)。
+该入口的工作站和服务器配置分别是 `remote_rollout.yaml` 与 `remote_fastwam_server.yaml`；
+下文 `rollout.yaml` 仍用于本机 SmolVLA 推理。
 UR5/Robotiq 部分直接导入采集仓库现有的
 `xrobotoolkit_teleop/hardware/interface/universal_robots.py`，不复制驱动、不安装
 UR5e 社区插件，也不需要把整个 XRoboToolkit 项目及其依赖装入 LeRobot 环境。

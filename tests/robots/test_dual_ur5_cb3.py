@@ -152,6 +152,29 @@ def test_factory_and_feature_order(robot):
     assert features["observation.state"]["names"] == list(STATE_NAMES)
 
 
+def test_official_remote_hold_retains_applied_targets_without_camera_reads(driver, tmp_path, monkeypatch):
+    from lerobot.rollout.robot_wrapper import ThreadSafeRobot
+
+    robot = arm_robot(driver, tmp_path)
+    try:
+        wrapper = ThreadSafeRobot(robot)
+        wrapper.configure_position_hold()
+        measured = wrapper.get_observation()
+        monkeypatch.setattr(robot, "get_observation", lambda: pytest.fail("hold must not read cameras"))
+        wrapper.hold()
+        np.testing.assert_allclose(robot._target, [measured[name] for name in STATE_NAMES])
+        target = {name: measured[name] + (0.1 if name in STATE_NAMES[:12] else 0) for name in STATE_NAMES}
+        applied = wrapper.send_action(target)
+        previous_refresh = robot._last_action_time
+        wrapper.hold()
+        np.testing.assert_allclose(robot._target, [applied[name] for name in STATE_NAMES])
+        assert robot._last_action_time >= previous_refresh
+        assert not wrapper.hardware_failure
+        assert all(not controller.gripper.commands for controller in robot.controllers.values())
+    finally:
+        robot.disconnect()
+
+
 def test_read_only_connect_and_action_do_not_create_motion_interface(robot, driver):
     robot.connect()
     driver.URController.assert_not_called()
@@ -962,9 +985,9 @@ def test_relaxed_example_preserves_normal_targets_and_limits_large_offsets(
 def test_official_sync_engine_preserves_14d_state_and_action_order(robot):
     import torch
 
+    from lerobot.inference.sync import SyncInferenceEngine
     from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
     from lerobot.processor import make_default_policy_processor_steps, make_policy_processor_pipelines
-    from lerobot.rollout.inference.sync import SyncInferenceEngine
     from lerobot.utils.feature_utils import build_dataset_frame, dataset_to_policy_features
 
     features = {

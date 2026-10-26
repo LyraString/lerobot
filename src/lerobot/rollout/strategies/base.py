@@ -36,15 +36,15 @@ class BaseStrategy(RolloutStrategy):
 
     def setup(self, ctx: RolloutContext) -> None:
         """Initialise the inference engine."""
-        super().setup(ctx)
+        self._init_engine(ctx)
         logger.info("Base strategy ready")
 
     def run(self, ctx: RolloutContext) -> None:
         """Run the autonomous control loop until shutdown or duration expires."""
-        engine = self._engine
+        engine = self._require_engine()
         cfg = ctx.runtime.cfg
         robot = ctx.hardware.robot_wrapper
-        interpolator = self._interpolator
+        interpolator = self._require_interpolator()
 
         timer = CycleTimer(
             cfg.fps,
@@ -73,28 +73,9 @@ class BaseStrategy(RolloutStrategy):
                 if self._handle_warmup(cfg.use_torch_compile, timer):
                     continue
 
-                applying = self._view_mask_tick(ctx, runnable=True)
-                if applying:
-                    with timer.section("telemetry"):
-                        self._log_view_mask(ctx.runtime)
-                    if self._view_mask_failed_should_stop(ctx):
-                        logger.error("View mask failed; ending rollout segment")
-                        break
-                    # Keep polling the engine while APPLYING.  Sync inference can
-                    # produce the fresh action inline; RTC may already have one in
-                    # its queue.  send_next_action holds only when no fresh action
-                    # is available, and the engine's revision guard rejects stale work.
-                    action_dict = send_next_action(obs_processed, obs, ctx, interpolator, timer)
-                    if action_dict is None:
-                        with timer.section("query"):
-                            engine.pump_query(obs_processed)
-                        timer.wait()
-                        continue
-                else:
-                    action_dict = send_next_action(obs_processed, obs, ctx, interpolator, timer)
+                action_dict = send_next_action(obs_processed, obs, ctx, interpolator, timer)
                 with timer.section("telemetry"):
                     self._log_telemetry(obs_processed, action_dict, ctx.runtime)
-                    self._log_view_mask(ctx.runtime)
 
                 # Service the text-query channel (/vqa answers, /autosteer turns) at
                 # the end of the tick; no-op when nothing is queued.

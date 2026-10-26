@@ -1,0 +1,60 @@
+# Server-side schema template. Validate it against the trained checkpoint before use.
+deployment: ur5-fastwam
+model:
+  repo_or_path: /absolute/path/to/fastwam/checkpoints/last/pretrained_model
+  device: cuda
+execution:
+  supported_modes: [chunk]
+  action_fps: 20.0
+  n_action_steps: null  # Keep the checkpoint's execution slice.
+  action_deadline_s: 5.0
+  idle_timeout_s: 10.0
+  warmup_calls: 2
+language:
+  enabled: false
+zenoh:
+  mode: peer
+  listen_endpoints: [tcp/127.0.0.1:7447]
+semantics: dual-ur5-cb3-radians-gripper-closure-v1
+robot_type: dual_ur5_cb3
+features:
+  - name: observation.state
+    shape: [14]
+    dtype: float32
+    names: &ur5_components
+      - left_joint_1.pos
+      - left_joint_2.pos
+      - left_joint_3.pos
+      - left_joint_4.pos
+      - left_joint_5.pos
+      - left_joint_6.pos
+      - right_joint_1.pos
+      - right_joint_2.pos
+      - right_joint_3.pos
+      - right_joint_4.pos
+      - right_joint_5.pos
+      - right_joint_6.pos
+      - left_gripper.pos
+      - right_gripper.pos
+    semantics: dual-ur5-cb3-radians-gripper-closure-v1
+  - name: observation.images.exterior
+    shape: [480, 640, 3]
+    dtype: uint8
+    kind: rgb
+    semantics: rgb-exterior-v1
+  - name: observation.images.left_wrist
+    shape: [480, 640, 3]
+    dtype: uint8
+    kind: rgb
+    semantics: rgb-left-wrist-v1
+  - name: observation.images.right_wrist
+    shape: [480, 640, 3]
+    dtype: uint8
+    kind: rgb
+    semantics: rgb-right-wrist-v1
+action_feature:
+  name: action
+  shape: [14]
+  dtype: float32
+  names: *ur5_components
+  semantics: dual-ur5-cb3-radians-gripper-closure-v1

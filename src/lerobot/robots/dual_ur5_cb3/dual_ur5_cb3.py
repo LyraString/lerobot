@@ -78,6 +78,7 @@ class DualUR5CB3(Robot):
 
     config_class = DualUR5CB3Config
     name = "dual_ur5_cb3"
+    supports_position_hold = True
 
     def __init__(self, config: DualUR5CB3Config) -> None:
         super().__init__(config)
