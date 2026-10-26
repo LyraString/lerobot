@@ -56,6 +56,15 @@ uv run --no-sync lerobot-rollout \
 `Pick up the object and place it on the scales`；服务端 `execution.warmup_task`
 和客户端 `task` 均使用这个任务。改成其他文字前需要相应的文本嵌入。
 
+2026-10-26 的真实权重/模拟观测验证已通过服务端预热与 SSH 隧道。
+两次 JPEG 请求往返为 1.19 秒和 0.97 秒，一次 raw 请求为 1.44 秒；
+均返回有限的 `[10, 14]` 动作并通过客户端校验。这里使用三路随机图像和零状态，
+不涉及机器人，也不验证任务成功率。单次策略计算约 0.64–0.75 秒。
+当前 10 步只覆盖 0.5 秒，短于这次测得的推理往返时间，连续执行会等待新动作；
+20 Hz 是动作播放频率，不是模型推理频率。
+先完成只读观测验证，再根据实测耗时决定执行片段、合并方式和模型加速设置；
+仅加大 `n_action_steps` 不能据此保证连续执行，仍须检查动作年龄和新旧块的衔接。
+
 服务器安装通信依赖时保留了原有 Torch 等训练依赖。切换分支前的训练草稿完整保存在
 `refs/codex/fastwam-training-wip-20261026`，包括当时未跟踪的训练配置和文本缓存生成脚本。
 将来需要恢复训练现场时，先停止推理服务，确认当前工作区干净，再运行：
@@ -83,6 +92,8 @@ git stash apply refs/codex/fastwam-training-wip-20261026
 - 从服务器训练代码移入已保存的文本缓存 processor 及配置兼容项；补入上游
   Adam/AdamW 的 `fused` 字段，保留 checkpoint 的 `optimizer_fused` 设置。
   服务端支持显式 `execution.warmup_task`，让预热使用 checkpoint 已缓存的真实任务。
+- 缓存嵌入存在时，不再从同一批次的任务元数据生成另一份 prompt，避免真实核心
+  拒绝同时提供 prompt 和 context；显式传入二者仍由模型做互斥校验。
 
 上游后续的外部 VLM、G1 SONIC 和全仓类型检查改动不属于这个双臂 FastWAM 移植。
 两台机器应使用本分支同一个经过验证的提交，不要混用旧 gRPC 服务和新 Zenoh 客户端。
@@ -188,5 +199,8 @@ router/mTLS 测试。直接 TCP/Zenoh、raw/JPEG、独立进程和 FastWAM 处�
 14 维状态、`[1, 128, 4096]` 文本嵌入和 14 维反归一化动作均可加载并产生有限值。
 文本缓存兼容和任务预热补丁的回归为 316 passed、2 skipped，覆盖
 `tests/inference`、`tests/remote_inference`、FastWAM 策略和优化器测试。
+真实预热发现的缓存条件冲突修复后，FastWAM 相关 15 项测试再次通过；
+gpu57 的 003574 权重完成两次预热，并通过上述 JPEG/raw 隧道验证。
+测试服务及临时 SSH 隧道在验证后关闭，使用时按前面的三个终端命令重新启动。
 
 参考：[官方远程推理文档](https://huggingface.co/docs/lerobot/main/en/remote_inference)。
