@@ -104,6 +104,10 @@ class FastWAMPolicy(PreTrainedPolicy):
         only those shape-mismatched tensors — leaving them at their freshly
         initialized values — and load every compatible tensor. With `strict=True`
         the standard exact-match loader is used.
+
+        Stage checkpoint tensors on CPU before copying into the model's existing
+        parameters. A full-precision training checkpoint must not consume CUDA
+        memory alongside the model that was already constructed in inference dtype.
         """
         from safetensors import safe_open
 
@@ -118,7 +122,7 @@ class FastWAMPolicy(PreTrainedPolicy):
                     mismatched.append(key)
 
         if not mismatched:
-            return super()._load_as_safetensor(model, model_file, map_location, strict)
+            return super()._load_as_safetensor(model, model_file, "cpu", strict)
         if strict:
             raise RuntimeError(
                 f"FastWAM: {len(mismatched)} checkpoint tensors have a shape mismatch under "

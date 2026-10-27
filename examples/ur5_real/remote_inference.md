@@ -96,6 +96,41 @@ checkpoint 是其中 `model.repo_or_path` 指向目录下的 `config.json`。
 或启动服务时增加 `--execution.n_action_steps=20`；该值不能超过当前预测长度 32。
 此覆盖不修改原 checkpoint，也不改变每次预测的 32 步；修改后重启服务生效。
 
+## 显存与权重加载
+
+FastWAM 从 CPU 读取 checkpoint，再复制到已构建的模型参数中，
+最终模型仍使用配置指定的 GPU 和精度。无需额外 CLI 参数。
+这避免了 FP32 训练权重与 GPU 上的 BF16 模型同时占用显存；启动时需要足够的主机内存。
+
+2026-10-27 对 003574 checkpoint 做了 A100 单卡容量验证：
+PyTorch 可用显存限制为 22 GiB，三路相机合并尺寸 224×672，
+BF16、10 次去噪、缓存文本上下文，未启用 `compile_action_infer`。
+CPU 暂存加载完成两次预热和三次额外预测；PyTorch 峰值约 12.96 GiB，
+含 CUDA 上下文的整卡采样峰值约 13.73 GiB。
+这些结果支持当前配置的 24GB 显存预算；并非 4090 速度或实机任务验证。
+启用文本编码器、编译或更改输入尺寸后需要重新测量。
+
+## 三台机器的代码同步
+
+工作站、A100 和 4090 仓库统一使用共同远端 `origin` 的 `feat/fastwam-libero`。
+在一台机器完成修改、测试和提交后推送：
+
+```bash
+git push -u origin feat/fastwam-libero
+```
+
+其余机器在各自仓库内检查本地改动后同步：
+
+```bash
+git status --short
+git fetch origin
+git merge --ff-only origin/feat/fastwam-libero
+```
+
+同步前保留未提交的训练草稿；若与更新的文件重叠，先合并本地改动。
+模型权重、HF 缓存及本机环境单独配置；服务器模型路径使用启动参数覆盖。
+4090 仓库位于 `idiot@10.13.21.101:~/zhj/ler/lerobot`，尚未完成权重部署与推理实测。
+
 ## 移植范围
 
 - 官方 `ae2b57f12223c8c5184fcd814eb63cd9ce7de203`：PR #4937，包含推理模块迁移、
