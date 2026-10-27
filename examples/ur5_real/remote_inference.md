@@ -8,7 +8,9 @@
 ## 当前两台机器的启动命令
 
 工作站：`/home/carto317/zhj/lerobot`。服务器：`zhj@10.13.21.170`，
-仓库是 `/data0/zhj/lerobot`。两端使用 `feat/official-remote-inference`。
+仓库是 `/data0/zhj/lerobot`。
+工作站继续使用 `feat/official-remote-inference`；服务器已将推理改动合入原训练分支
+`feat/fastwam-libero`，直接在这个分支启动即可。
 服务器 YAML 已填写 `fastwam_base_dual_ur5_full_finetune_text_cache_bs4`
 的 `003574/pretrained_model`；已核对数据集 20 Hz、三路相机和左臂/右臂/夹爪的 14 维顺序。
 
@@ -65,15 +67,11 @@ uv run --no-sync lerobot-rollout \
 先完成只读观测验证，再根据实测耗时决定执行片段、合并方式和模型加速设置；
 仅加大 `n_action_steps` 不能据此保证连续执行，仍须检查动作年龄和新旧块的衔接。
 
-服务器安装通信依赖时保留了原有 Torch 等训练依赖。切换分支前的训练草稿完整保存在
-`refs/codex/fastwam-training-wip-20261026`，包括当时未跟踪的训练配置和文本缓存生成脚本。
-将来需要恢复训练现场时，先停止推理服务，确认当前工作区干净，再运行：
-
-```bash
-cd /data0/zhj/lerobot
-git switch feat/fastwam-libero
-git stash apply refs/codex/fastwam-training-wip-20261026
-```
+服务器安装通信依赖时保留了原有 Torch 等训练依赖。2026-10-27 已将推理分支合入
+`feat/fastwam-libero`，并恢复了原先未提交的训练草稿；训练和推理可在同一个服务器分支使用。
+已包含在推理提交里的文本缓存代码随合并保留，其余文档、测试、训练配置和文本缓存生成脚本
+恢复为未提交状态。完整备份仍保存在 `refs/codex/fastwam-training-wip-20261026`，
+无需再次执行 `git stash apply`。
 
 ## 移植范围
 
@@ -96,7 +94,8 @@ git stash apply refs/codex/fastwam-training-wip-20261026
   拒绝同时提供 prompt 和 context；显式传入二者仍由模型做互斥校验。
 
 上游后续的外部 VLM、G1 SONIC 和全仓类型检查改动不属于这个双臂 FastWAM 移植。
-两台机器应使用本分支同一个经过验证的提交，不要混用旧 gRPC 服务和新 Zenoh 客户端。
+两台机器应包含同一套经过验证的推理协议与 FastWAM 兼容改动；服务器可以额外保留训练提交。
+不要混用旧 gRPC 服务和新 Zenoh 客户端。
 
 ## 校外服务器
 
