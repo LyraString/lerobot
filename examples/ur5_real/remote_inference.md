@@ -9,8 +9,8 @@
 
 工作站：`/home/carto317/zhj/lerobot`。服务器：`zhj@10.13.21.170`，
 仓库是 `/data0/zhj/lerobot`。
-工作站继续使用 `feat/official-remote-inference`；服务器已将推理改动合入原训练分支
-`feat/fastwam-libero`，直接在这个分支启动即可。
+工作站和服务器均使用 `feat/fastwam-libero`；推理改动已合入这个分支，
+两端的临时推理分支已删除，直接在 FastWAM 分支启动即可。
 服务器 YAML 已填写 `fastwam_base_dual_ur5_full_finetune_text_cache_bs4`
 的 `003574/pretrained_model`；已核对数据集 20 Hz、三路相机和左臂/右臂/夹爪的 14 维顺序。
 
@@ -72,6 +72,29 @@ uv run --no-sync lerobot-rollout \
 已包含在推理提交里的文本缓存代码随合并保留，其余文档、测试、训练配置和文本缓存生成脚本
 恢复为未提交状态。完整备份仍保存在 `refs/codex/fastwam-training-wip-20261026`，
 无需再次执行 `git stash apply`。
+
+## 当前动作块配置
+
+当前 003574 checkpoint 的有效参数如下；下表描述配置值，CLI 显式覆盖时以覆盖值为准。
+
+| 参数 | 当前值 | 配置来源 |
+| --- | --- | --- |
+| 每次预测动作步数 | 32 | checkpoint `config.json` 的 `action_horizon` |
+| 每次返回的执行片段 | 前 10 步 | checkpoint `n_action_steps=10`；服务端 YAML 的 `execution.n_action_steps: null` 表示继承 |
+| 动作播放频率 | 20 Hz | 服务端 `execution.action_fps`，工作站 `fps` |
+| 去噪迭代次数 | 10 | checkpoint 的 `num_inference_steps`，与动作步数含义不同 |
+| 推理/合并模式 | `chunk` / `aligned` | 工作站 `inference.mode`、`inference.chunk_merge` |
+
+32 步预测覆盖 1.6 秒；10 步执行片段覆盖 0.5 秒。服务端会对完整预测做后处理，
+截取前 10 步，再返回 `[10, 14]` 动作块。队列按时间对齐并校验动作年龄，过期动作可能被丢弃。
+这不是每执行完 10 步才同步发下一次请求，客户端会依据剩余队列和实测延迟提前请求。
+
+服务器配置文件是 `examples/ur5_real/remote_fastwam_server.yaml`；
+checkpoint 是其中 `model.repo_or_path` 指向目录下的 `config.json`。
+工作站配置文件是 `examples/ur5_real/remote_rollout.yaml`。
+若需调整执行片段，可改服务器 YAML 的 `execution.n_action_steps`，
+或启动服务时增加 `--execution.n_action_steps=20`；该值不能超过当前预测长度 32。
+此覆盖不修改原 checkpoint，也不改变每次预测的 32 步；修改后重启服务生效。
 
 ## 移植范围
 
