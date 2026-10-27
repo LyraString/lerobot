@@ -21,6 +21,8 @@ from typing import Any
 import torch
 from torch import Tensor
 
+from lerobot.configs import FeatureType
+from lerobot.policies.chunk import ChunkPolicySpec, FeatureSpec
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.utils.constants import OBS_STATE
 from lerobot.utils.import_utils import require_package
@@ -153,6 +155,42 @@ class FastWAMPolicy(PreTrainedPolicy):
 
     def reset(self) -> None:
         self._action_queue: deque[Tensor] = deque([], maxlen=self.config.n_action_steps)
+
+    def chunk_inference_spec(self) -> ChunkPolicySpec:
+        """Declare current-frame inference independently of future training targets.
+
+        The temporal observation indices supervise the video expert during training.
+        ``predict_action_chunk`` consumes the current images and state, and returns
+        the full ``action_horizon`` without using select_action's playback queue.
+        """
+        if self.config.n_obs_steps != 1:
+            raise ValueError("FastWAM chunk serving requires n_obs_steps=1.")
+        return ChunkPolicySpec(
+            prediction_steps=self.config.action_horizon,
+            execution_steps=self.config.n_action_steps,
+        )
+
+    def validate_chunk_input_features(self, features: tuple[FeatureSpec, ...]) -> None:
+        """Keep the model's camera resizing while enforcing input names and state shape."""
+        self.config.validate_features()
+        expected = self.config.input_features or {}
+        supplied = {feature.name: feature for feature in features}
+        allowed = set(expected)
+        if self.config.proprio_dim is None:
+            allowed.add(OBS_STATE)
+        if not expected.keys() <= supplied.keys() or not supplied.keys() <= allowed:
+            raise ValueError("FastWAM requires all configured inputs and only known camera features.")
+        for name, feature in supplied.items():
+            if name == OBS_STATE and name not in expected:
+                if feature.kind != "tensor" or len(feature.shape) != 1:
+                    raise ValueError("Unused FastWAM robot state must be a tensor vector.")
+                continue
+            policy_feature = expected[name]
+            if policy_feature.type == FeatureType.VISUAL:
+                if feature.kind != "rgb":
+                    raise ValueError(f"FastWAM requires RGB camera inputs: {name}.")
+            elif feature.kind != "tensor" or feature.shape != tuple(policy_feature.shape):
+                raise ValueError(f"Tensor feature shape differs from checkpoint: {name}.")
 
     def _batch_to_training_sample(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
         """Adapt a standard LeRobot batch to the FastWAM-native sample that
@@ -300,8 +338,11 @@ def _scalar(value: Any) -> Any:
 
 
 def _batch_to_infer_kwargs(batch: dict[str, Tensor], config: FastWAMConfig) -> dict[str, Any]:
+    # A saved text-cache processor keeps task metadata alongside its embeddings.
+    # Only synthesize a prompt from that metadata when no context was supplied.
+    has_context = batch.get("context") is not None or batch.get("context_mask") is not None
     return {
-        "prompt": _prompt_from_batch(batch=batch, config=config),
+        "prompt": batch.get("prompt") if has_context else _prompt_from_batch(batch=batch, config=config),
         "input_image": _input_image_from_batch(batch, config),
         "action_horizon": config.action_horizon,
         "proprio": batch.get("proprio", batch.get(OBS_STATE)),

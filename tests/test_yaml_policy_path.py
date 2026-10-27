@@ -4,8 +4,10 @@ import json
 import sys
 import tempfile
 from dataclasses import dataclass, field
+from pathlib import Path
 from unittest.mock import patch
 
+import pytest
 import yaml
 
 from lerobot.configs import parser
@@ -280,6 +282,37 @@ class _DummyConfig:
     @classmethod
     def __get_path_fields__(cls):
         return ["nested"]
+
+
+@pytest.mark.parametrize("suffix", [".yaml", ".json"])
+@pytest.mark.parametrize("split_args", [False, True])
+def test_wrap_filters_cli_overrides_for_config_path_fields(tmp_path: Path, split_args: bool, suffix: str):
+    config_path = tmp_path / f"config{suffix}"
+    config = {"nested": {"path": "some/checkpoint", "foo": 42}, "other": "set-via-yaml"}
+    config_path.write_text(json.dumps(config) if suffix == ".json" else yaml.safe_dump(config))
+    cli_args = (
+        ["--config_path", str(config_path), "--nested.foo", "10", "--other", "set-via-cli"]
+        if split_args
+        else [f"--config_path={config_path}", "--nested.foo=10", "--other=set-via-cli"]
+    )
+    _config_path_args.clear()
+    _config_yaml_overrides.clear()
+
+    @parser.wrap()
+    def main(cfg: _DummyConfig) -> _DummyConfig:
+        return cfg
+
+    try:
+        with patch.object(sys, "argv", ["prog", *cli_args]):
+            cfg = main()
+            assert get_path_arg("nested") == "some/checkpoint"
+            assert get_yaml_overrides("nested") == ["--foo=42"]
+            assert parser.get_cli_overrides("nested") == (["--foo", "10"] if split_args else ["--foo=10"])
+        assert cfg.nested.foo == 0
+        assert cfg.other == "set-via-cli"
+    finally:
+        _config_path_args.clear()
+        _config_yaml_overrides.clear()
 
 
 def test_wrap_uses_cleaned_config_for_draccus_parse():

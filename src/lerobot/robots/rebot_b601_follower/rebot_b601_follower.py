@@ -64,6 +64,7 @@ class RebotB601Follower(Robot):
 
     config_class = RebotB601FollowerRobotConfig
     name = "rebot_b601_follower"
+    supports_position_hold = True
 
     def __init__(self, config: RebotB601FollowerRobotConfig):
         require_package("motorbridge", extra="rebot")

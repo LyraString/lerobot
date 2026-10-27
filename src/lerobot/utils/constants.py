@@ -49,6 +49,11 @@ INFO = "info"
 QUERY_KIND = "query_kind"
 QUERY_TEXT = "query_text"
 
+# Optional per-inference metadata carried through the processor transition. The
+# container is intentionally generic so rollout-only capabilities do not each add
+# their own keys to the shared constants namespace.
+RUNTIME_CONTEXT = "__runtime_context__"
+
 # Raw semantic-language dataset columns. These live here so lightweight policy
 # processors do not need to import the optional datasets/pyarrow stack.
 LANGUAGE_PERSISTENT = "language_persistent"

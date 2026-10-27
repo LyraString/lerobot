@@ -1,0 +1,55 @@
+robot:
+  type: dual_ur5_cb3
+  teleop_root: /home/carto317/XRoboToolkit-Teleop-Sample-Python
+  left_robot_ip: 192.168.1.50
+  right_robot_ip: 192.168.1.60
+  enable_motion: false
+  enable_gripper: false
+  servo_time: 0.017
+  lookahead_time: 0.1
+  servo_gain: 300.0
+  joint_limit: 6.283185307179586
+  max_joint_velocity: 1.0
+  max_relative_target: 0.5
+  clip_relative_target: true
+  max_tracking_error: 0.3
+  action_timeout_s: 1.0
+  camera_max_age_ms: 200
+  cameras:
+    exterior:
+      type: intelrealsense
+      serial_number_or_name: "937622072836"
+      fps: 30
+      width: 640
+      height: 480
+    left_wrist:
+      type: intelrealsense
+      serial_number_or_name: "941322071481"
+      fps: 30
+      width: 640
+      height: 480
+    right_wrist:
+      type: intelrealsense
+      serial_number_or_name: "045322072148"
+      fps: 30
+      width: 640
+      height: 480
+policy:
+  path: ./policy/SmolVLA
+  device: cuda
+strategy:
+  type: base
+inference:
+  type: rtc
+  rtc:
+    enabled: true
+    mode: guided
+    execution_horizon: 30
+  queue_threshold: 30
+fps: 20
+duration: 5
+interactive: true
+return_to_initial_position: false
+task: Pick up the object and place it on the scales
+display_data: false
+play_sounds: false

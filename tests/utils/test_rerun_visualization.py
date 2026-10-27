@@ -49,6 +49,14 @@ def mock_rerun(monkeypatch):
         def compress(self, *a, **k):
             return self
 
+    class DummyTextLog:
+        def __init__(self, text):
+            self.text = text
+
+    class DummyBoxes2D:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
     class DummyDepthImage:
         def __init__(self, arr, meter=None, colormap=None):
             self.arr = arr
@@ -82,6 +90,8 @@ def mock_rerun(monkeypatch):
         __spec__=SimpleNamespace(name="rerun", submodule_search_locations=None),
         Scalars=DummyScalar,
         Image=DummyImage,
+        TextLog=DummyTextLog,
+        Boxes2D=DummyBoxes2D,
         DepthImage=DummyDepthImage,
         components=SimpleNamespace(Colormap=SimpleNamespace(Viridis="viridis")),
         log=dummy_log,
@@ -309,3 +319,131 @@ def test_log_rerun_data_blueprint_sent_only_once(mock_rerun):
     # Still only one blueprint, and the cached one is unchanged.
     assert len(blueprints) == 1
     assert rv.log_rerun_data.blueprint is first_blueprint
+
+
+def test_log_rerun_saliency_logs_entities(mock_rerun):
+    """Saliency frames are logged under ``saliency/<cam>`` and registered as known paths."""
+    rv, calls, _blueprints = mock_rerun
+
+    frame = np.full((6, 8, 3), 128, dtype=np.uint8)
+    rv.log_rerun_saliency({"cam1": frame})
+
+    img = _obj_for(calls, "saliency/cam1")
+    assert type(img).__name__ == "DummyImage"
+    assert img.arr is frame  # logged as-is, no transposition
+    assert _kwargs_for(calls, "saliency/cam1").get("static", False) is True
+    assert "cam1" in rv._SALIENCY_PATHS
+
+
+def test_log_rerun_saliency_resends_blueprint_only_for_new_paths(mock_rerun):
+    """A blueprint re-send happens exactly when a previously-unseen camera path arrives."""
+    rv, calls, blueprints = mock_rerun
+
+    # Simulate the observation blueprint having been sent before the first saliency frame.
+    rv.log_rerun_data(observation={"temp": 1.0}, action={"a": 2.0})
+    assert len(blueprints) == 1
+    calls.clear()
+
+    frame = np.zeros((4, 4, 3), dtype=np.uint8)
+    rv.log_rerun_saliency({"cam1": frame})  # new path → rebuild + re-send
+    assert len(blueprints) == 2
+    assert {v.origin for v in _views_by_kind(blueprints[1], "Spatial2DView")} == {"saliency/cam1"}
+    # The rebuilt blueprint still carries the stashed observation/action views.
+    ts_views = {v.name: v for v in _views_by_kind(blueprints[1], "TimeSeriesView")}
+    assert ts_views["observation"].contents == ["observation.temp"]
+    assert ts_views["action"].contents == ["action.a"]
+
+    calls.clear()
+    rv.log_rerun_saliency({"cam1": frame})  # same path → no re-send
+    assert len(blueprints) == 2
+
+    calls.clear()
+    rv.log_rerun_saliency({"cam2": frame})  # another new path → one more re-send
+    assert len(blueprints) == 3
+    spatial_origins = {v.origin for v in _views_by_kind(blueprints[2], "Spatial2DView")}
+    assert spatial_origins == {"saliency/cam1", "saliency/cam2"}
+
+
+def test_log_rerun_saliency_budget_logs_scalars(mock_rerun):
+    """Budget shares are logged as scalars under ``saliency/budget/<segment>``."""
+    rv, calls, _blueprints = mock_rerun
+
+    rv.log_rerun_saliency_budget({"camera1": 0.5, "language": 0.4, "state": 0.1})
+
+    cam = _obj_for(calls, "saliency/budget/camera1")
+    assert type(cam).__name__ == "DummyScalar"
+    assert float(cam.value) == pytest.approx(0.5)
+    assert float(_obj_for(calls, "saliency/budget/language").value) == pytest.approx(0.4)
+    assert float(_obj_for(calls, "saliency/budget/state").value) == pytest.approx(0.1)
+    assert {"camera1", "language", "state"} == rv._SALIENCY_BUDGET_SEGMENTS
+
+
+def test_log_rerun_saliency_budget_resends_blueprint_with_timeseries_view(mock_rerun):
+    """The first budget log rebuilds the blueprint with a visible budget time-series view."""
+    rv, calls, blueprints = mock_rerun
+
+    rv.log_rerun_data(observation={"temp": 1.0}, action={"a": 2.0})
+    assert len(blueprints) == 1
+    assert "saliency/budget" not in {v.name for v in _views_by_kind(blueprints[0], "TimeSeriesView")}
+
+    budget = {"camera1": 0.5, "language": 0.4, "state": 0.1}
+    rv.log_rerun_saliency_budget(budget)  # new segments → rebuild + re-send
+    assert len(blueprints) == 2
+    ts_views = {v.name: v for v in _views_by_kind(blueprints[1], "TimeSeriesView")}
+    assert ts_views["saliency/budget"].contents == [
+        "saliency/budget/camera1",
+        "saliency/budget/language",
+        "saliency/budget/state",
+    ]
+    assert ts_views["observation"].contents == ["observation.temp"]  # stashed views preserved
+
+    rv.log_rerun_saliency_budget({"camera1": 0.6, "language": 0.3, "state": 0.1})  # no new segments
+    assert len(blueprints) == 2  # no re-send
+
+
+def test_view_mask_status_does_not_copy_or_log_full_resolution_images(mock_rerun):
+    rv, calls, _blueprints = mock_rerun
+    frame = np.ones((8, 8, 3), dtype=np.uint8)
+
+    rv.log_rerun_view_mask(
+        {"observation.images.front": True},
+        revision=1,
+        state="applying",
+        observation={"observation.images.front": frame},
+    )
+
+    assert not any(type(obj).__name__ == "DummyImage" for _, obj, _ in calls)
+    assert any(
+        key == "observation.images.front" and type(obj).__name__ == "DummyBoxes2D" for key, obj, _ in calls
+    )
+
+
+def test_view_mask_status_uses_raw_display_path_after_rename(mock_rerun):
+    rv, calls, _blueprints = mock_rerun
+    frame = np.ones((8, 8, 3), dtype=np.uint8)
+
+    rv.log_rerun_view_mask(
+        {"observation.images.cam_high": True},
+        revision=1,
+        state="applying",
+        observation={"front": frame},
+        display_paths={"observation.images.cam_high": "front"},
+    )
+
+    assert any(key == "observation.front" and type(obj).__name__ == "DummyBoxes2D" for key, obj, _ in calls)
+
+
+def test_view_mask_label_anchor_is_inset_from_left_edge(mock_rerun):
+    rv, calls, _blueprints = mock_rerun
+    frame = np.ones((8, 8, 3), dtype=np.uint8)
+
+    rv.log_rerun_view_mask(
+        {"observation.images.front": False},
+        revision=0,
+        state="active",
+        observation={"observation.images.front": frame},
+    )
+
+    badge = _obj_for(calls, "observation.images.front")
+    assert badge.kwargs["labels"] == ["VISIBLE"]
+    assert badge.kwargs["mins"] == [[64, 0]]

@@ -182,3 +182,11 @@ terminal outputs
 
 # Repo Wiki
 docs/source/repository_wiki_zh.md
+# models parameter
+policy/
+
+# Datasets
+Datasets/
+
+# models
+models/lehome

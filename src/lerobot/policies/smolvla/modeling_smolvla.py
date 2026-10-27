@@ -60,9 +60,11 @@ import torch
 import torch.nn.functional as F  # noqa: N812
 from torch import Tensor, nn
 
+from lerobot.configs import FeatureType
 from lerobot.utils.constants import ACTION, OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS, OBS_STATE
 from lerobot.utils.import_utils import require_package
 
+from ..chunk import FeatureSpec
 from ..common.flow_matching import euler_integrate, sample_noise, sample_time_beta
 from ..common.vla_utils import (
     create_sinusoidal_pos_embedding,
@@ -331,6 +333,35 @@ class SmolVLAPolicy(PreTrainedPolicy):
             loss_dict["loss"] = loss.item()
             return loss, loss_dict
 
+    def validate_chunk_input_features(self, features: tuple[FeatureSpec, ...]) -> None:
+        """Preserve prepare_images' camera subset, resizing and padding semantics.
+
+        The deployment explicitly selects physical cameras. Missing visual slots
+        remain missing; prepare_images applies the checkpoint's empty-camera limit
+        and masks exactly as in local inference. Never synthesize unmasked cameras.
+        """
+        expected = self.config.input_features or {}
+        supplied = {feature.name: feature for feature in features}
+        required = {name for name, feature in expected.items() if feature.type != FeatureType.VISUAL}
+        if not required <= supplied.keys() or not supplied.keys() <= expected.keys():
+            raise ValueError("SmolVLA requires all nonvisual inputs and only known camera features.")
+        if not any(expected[name].type == FeatureType.VISUAL for name in supplied):
+            raise ValueError("SmolVLA requires at least one camera.")
+        for name, feature in supplied.items():
+            policy_feature = expected[name]
+            if policy_feature.type == FeatureType.VISUAL:
+                shape = policy_feature.shape
+                if len(shape) != 3 or shape[0] != 3 or feature.kind != "rgb":
+                    raise ValueError(f"SmolVLA requires RGB camera inputs: {name}.")
+                if self.config.resize_imgs_with_padding is None and feature.shape != (
+                    shape[1],
+                    shape[2],
+                    shape[0],
+                ):
+                    raise ValueError(f"RGB feature shape differs without policy resizing: {name}.")
+            elif feature.kind != "tensor" or feature.shape != tuple(policy_feature.shape):
+                raise ValueError(f"Tensor feature shape differs from checkpoint: {name}.")
+
     def prepare_images(self, batch):
         """Apply SmolVLA preprocessing to the images, like resizing to 224x224 and padding to keep aspect ratio, and
         convert pixel range from [0.0, 1.0] to [-1.0, 1.0] as requested by SigLIP.
@@ -529,6 +560,7 @@ class VLAFlowMatching(nn.Module):
         self.image_end_token = torch.tensor([self.fake_image_token], dtype=torch.long)
         self.prefix_length = self.config.prefix_length
         self.rtc_processor = rtc_processor
+        self._attention_num_steps: int | None = None
 
         # Compile model if requested
         if config.compile_model:
@@ -755,6 +787,7 @@ class VLAFlowMatching(nn.Module):
             use_cache=self.config.use_cache,
         )
         num_steps = self.config.num_steps
+        self._attention_num_steps = int(num_steps)
 
         return euler_integrate(
             lambda input_x_t, current_timestep: self.denoise_step(
@@ -770,6 +803,7 @@ class VLAFlowMatching(nn.Module):
             inference_delay=kwargs.get("inference_delay"),
             prev_chunk_left_over=kwargs.get("prev_chunk_left_over"),
             execution_horizon=kwargs.get("execution_horizon"),
+            preserve_graph=getattr(self, "_saliency_preserve_graph", False),
         )
 
     def denoise_step(
@@ -780,6 +814,10 @@ class VLAFlowMatching(nn.Module):
         timestep,
     ):
         """Apply one denoising step of the noise `x_t` at a given timestep."""
+        if getattr(self.vlm_with_expert, "attention_capture", None) is not None and self._attention_num_steps:
+            self.vlm_with_expert.attention_step = int(
+                round((1.0 - float(timestep[0].detach().item())) * self._attention_num_steps)
+            )
         suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, timestep)
 
         suffix_len = suffix_pad_masks.shape[1]

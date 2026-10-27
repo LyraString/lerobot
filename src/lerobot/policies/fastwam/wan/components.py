@@ -109,6 +109,25 @@ def build_wan_tokenizer(*, model_id: str = WAN_T5_TOKENIZER, tokenizer_max_len: 
     return WanTokenizer(name=model_id, seq_len=int(tokenizer_max_len))
 
 
+@torch.no_grad()
+def encode_wan_prompt(
+    text_encoder: WanTextEncoder,
+    tokenizer: WanTokenizer,
+    prompt: str | Sequence[str],
+    device: str | torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Encode text with the same padding semantics for online and cached conditioning."""
+    ids, mask = tokenizer(prompt, return_mask=True, add_special_tokens=True)
+    ids = ids.to(device)
+    mask = mask.to(device, dtype=torch.bool)
+    prompt_emb = text_encoder(ids, mask)
+    seq_lens = mask.gt(0).sum(dim=1).long()
+    for i, v in enumerate(seq_lens):
+        prompt_emb[i, v:] = 0
+    # Padding embeddings are zeroed, while cross-attention sees a fixed-length context.
+    return prompt_emb.to(device=device), torch.ones_like(mask)
+
+
 def load_pretrained_wan_vae(*, torch_dtype: torch.dtype, device: str) -> WanVideoVAE38:
     """Load real Wan2.2 VAE weights from the diffusers repo (offline base creation)."""
     require_package("diffusers", extra="fastwam")

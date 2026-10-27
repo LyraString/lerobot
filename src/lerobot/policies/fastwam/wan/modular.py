@@ -28,6 +28,7 @@ from .components import (
     WAN22_DIFFUSERS_MODEL_ID,
     WAN_T5_TOKENIZER,
     build_wan_tokenizer,
+    encode_wan_prompt,
     load_pretrained_wan_text_encoder,
     load_pretrained_wan_vae,
     load_wan_video_dit,
@@ -1025,17 +1026,7 @@ class FastWAM(torch.nn.Module):
                 "Prompt encoding requires loaded text encoder/tokenizer. "
                 "Set `load_text_encoder=true` or provide precomputed `context/context_mask`."
             )
-        ids, mask = self.tokenizer(prompt, return_mask=True, add_special_tokens=True)
-        ids = ids.to(self.device)
-        mask = mask.to(self.device, dtype=torch.bool)
-        prompt_emb = self.text_encoder(ids, mask)
-        seq_lens = mask.gt(0).sum(dim=1).long()
-        for i, v in enumerate(seq_lens):
-            prompt_emb[i, v:] = 0
-        # Match FastWAM/Wan2.2 context semantics: padding embeddings are zeroed,
-        # while cross-attention still sees a fixed-length context.
-        mask = torch.ones_like(mask)
-        return prompt_emb.to(device=self.device), mask
+        return encode_wan_prompt(self.text_encoder, self.tokenizer, prompt, self.device)
 
     def _append_proprio_to_context(
         self,
